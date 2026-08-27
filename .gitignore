@@ -9,7 +9,6 @@ __pycache__/
 # Local model weights and Hugging Face caches
 models/
 .cache/
-artifacts/
 
 # Local secrets and generated environment files
 .env

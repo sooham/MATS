@@ -61,6 +61,26 @@ has six counterbalanced label assignments. Start at 24 on a 24 GiB GPU; try 48
 or 96 on larger GPUs, or reduce to 12 after an out-of-memory error. The notebook
 also remains runnable interactively with `uv run jupyter lab`.
 
+The model-independent controlled posterior banks can be generated without loading Qwen:
+
+```bash
+uv run --frozen python scripts/generate_controlled_posterior.py
+```
+
+This writes the elicitation controls, N=2/N=4 ladder, fixed N=8 bank, and a manifest to
+`artifacts/controlled_posterior/`. Add `--include-endpoints` for the separately labeled `r=0` and
+`r=1` diagnostic rows; zero-probability endpoint histories are omitted because their posterior is
+undefined. Use `--n8-schedules` to change the independent question-schedule count.
+
+Run the full Qwen behavioral gate on a CUDA machine with:
+
+```bash
+INFERENCE_BATCH_SIZE=48 scripts/run_notebook.sh notebooks/03_controlled_posterior_behavior.ipynb
+```
+
+Set `RUN_THINKING_ARM=1` to additionally generate the separately reported deliberative
+one-observation capability arm.
+
 ## Download Qwen3.5-4B
 
 After `hf auth login`, the script can use your local Hugging Face login cache. Alternatively, export a read token in the shell. Do not put the token in a file tracked by Git:
@@ -84,3 +104,7 @@ The script accepts `--model`, `--revision`, `--output-dir`, `--include`, and `--
 
 - `notebooks/01_minimal_noisy_source.ipynb` generates scripted noisy-source transcripts, computes exact Bayesian posteriors, and evaluates Qwen3.5-4B with forced-choice candidate and half-domain probes. Its six label assignments are batched, with a CUDA-aware default and an `INFERENCE_BATCH_SIZE` override. The notebook is committed unexecuted; its model-loading and inference cells are tagged `run-when-ready`.
 - `notebooks/02_fixed_transcript_reliability_sweep.ipynb` replays an exhaustive bank of identical question/answer histories under every reliability condition, separating controlled reliability sensitivity from exact natural-distribution-weighted performance.
+- `notebooks/03_controlled_posterior_behavior.ipynb` implements the behavioral gate: an explicit elicitation control, a counterfactually paired N=2/N=4 ladder, and a 32-schedule N=8 fixed bank. Its primary continuous target is exact posterior log-odds; left/right/tie classification, surface heuristics, tie subtypes, role/vocabulary/number-format robustness, and schedule-clustered uncertainty are reported separately.
+
+Primary papers that materially affect experiment design or interpretation are maintained as an
+annotated ledger in [`CITATIONS.md`](CITATIONS.md).

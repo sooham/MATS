@@ -1,0 +1,6 @@
+{"control_id": "elicitation_0_0", "left_weight": "9/10", "right_weight": "1/10", "normative_choice": "left"}
+{"control_id": "elicitation_0_1", "left_weight": "1/10", "right_weight": "9/10", "normative_choice": "right"}
+{"control_id": "elicitation_1_0", "left_weight": "7/10", "right_weight": "3/10", "normative_choice": "left"}
+{"control_id": "elicitation_1_1", "left_weight": "3/10", "right_weight": "7/10", "normative_choice": "right"}
+{"control_id": "elicitation_2_0", "left_weight": "1/2", "right_weight": "1/2", "normative_choice": "tie"}
+{"control_id": "elicitation_2_1", "left_weight": "1/2", "right_weight": "1/2", "normative_choice": "tie"}
