@@ -32,7 +32,7 @@ def test_counterbalanced_aggregation_recovers_semantics_and_log_odds() -> None:
         probe=probe,
         label_assignments=LABEL_ASSIGNMENTS,
         permutation_scores=permutation_scores,
-        transcript_format="single_user",
+        transcript_format="user_only",
         answer_vocabulary="yes_no",
         reliability_format="decimal",
         enable_thinking=False,

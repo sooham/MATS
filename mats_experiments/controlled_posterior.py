@@ -21,7 +21,6 @@ Answer = Literal["YES", "NO"]
 SemanticChoice = Literal["left", "right", "tie"]
 ProbeKind = Literal["candidate", "partition"]
 TieType = Literal["uniform_positive", "equal_positive", "both_zero"]
-TranscriptFormat = Literal["single_user", "alternating"]
 AnswerVocabulary = Literal["yes_no", "true_false", "symbols"]
 ReliabilityFormat = Literal["decimal", "percent", "fraction"]
 
@@ -642,7 +641,7 @@ def _answer_legend(vocabulary: AnswerVocabulary) -> tuple[str, Mapping[Answer, s
     return "Answers use KET for true and ZOG for false.", {"YES": "KET", "NO": "ZOG"}
 
 
-def _system_prompt(
+def _rules_text(
     example: ControlledExample,
     answer_vocabulary: AnswerVocabulary,
     reliability_format: ReliabilityFormat,
@@ -692,43 +691,20 @@ def messages_for_probe(
     probe: Probe,
     semantics_by_label: Sequence[SemanticChoice],
     *,
-    transcript_format: TranscriptFormat = "single_user",
     answer_vocabulary: AnswerVocabulary = "yes_no",
     reliability_format: ReliabilityFormat = "decimal",
 ) -> list[dict[str, str]]:
-    system = _system_prompt(example, answer_vocabulary, reliability_format)
+    rules = _rules_text(example, answer_vocabulary, reliability_format)
     _, answer_mapping = _answer_legend(answer_vocabulary)
     probe_text = _probe_text(probe, semantics_by_label)
-    if transcript_format == "single_user":
-        evidence_lines = ["OBSERVATIONS:"]
-        for observation in example.observations:
-            evidence_lines.append(
-                f"Question {observation.turn}: Is the secret in {_format_set(observation.subset)}?"
-            )
-            evidence_lines.append(f"SOURCE answer: {answer_mapping[observation.answer]}.")
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "\n".join((*evidence_lines, "", probe_text))},
-        ]
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    evidence_lines = ["OBSERVATIONS:"]
     for observation in example.observations:
-        messages.extend(
-            (
-                {
-                    "role": "assistant",
-                    "content": (
-                        f"Question {observation.turn}: Is the secret in "
-                        f"{_format_set(observation.subset)}?"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"SOURCE answer: {answer_mapping[observation.answer]}.",
-                },
-            )
+        evidence_lines.append(
+            f"Question {observation.turn}: Is the secret in {_format_set(observation.subset)}?"
         )
-    messages.append({"role": "user", "content": probe_text})
-    return messages
+        evidence_lines.append(f"SOURCE answer: {answer_mapping[observation.answer]}.")
+    content = "\n".join((rules, "", *evidence_lines, "", probe_text))
+    return [{"role": "user", "content": content}]
 
 
 def messages_for_elicitation(
@@ -742,6 +718,8 @@ def messages_for_elicitation(
         "tie": "They have equal weight.",
     }
     lines = [
+        "Choose the option corresponding to the greater weight, or equality.",
+        "",
         "Compare these two normalized weights:",
         f"LEFT = {fraction_string(control.left_weight)}",
         f"RIGHT = {fraction_string(control.right_weight)}",
@@ -750,13 +728,7 @@ def messages_for_elicitation(
         f"{label}: {texts[semantic]}" for label, semantic in zip(LABELS, semantics_by_label)
     )
     lines.append("Reply with exactly A, B, or C.")
-    return [
-        {
-            "role": "system",
-            "content": "Choose the option corresponding to the greater weight, or equality.",
-        },
-        {"role": "user", "content": "\n".join(lines)},
-    ]
+    return [{"role": "user", "content": "\n".join(lines)}]
 
 
 def serialize_probe(probe: Probe) -> dict[str, object]:

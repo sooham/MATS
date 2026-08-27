@@ -39,8 +39,7 @@ def validate_contextual_label_tokens(
     """Check that an assistant answer begins with the same IDs scored at the prompt boundary."""
 
     prefix_messages = [
-        {"role": "system", "content": "Reply with exactly A, B, or C."},
-        {"role": "user", "content": "Choose A."},
+        {"role": "user", "content": "Choose A. Reply with exactly A, B, or C."}
     ]
     prefix_ids = processor.apply_chat_template(
         prefix_messages,

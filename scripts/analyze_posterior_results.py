@@ -20,7 +20,8 @@ from matplotlib.ticker import PercentFormatter
 
 ARTIFACT_ROOT = REPO_ROOT / "artifacts"
 OUTPUT_DIR = REPO_ROOT / "reports" / "posterior_behavior"
-PRIMARY_ARM = ("single_user", "yes_no", "decimal", False)
+PRIMARY_ARM = ("user_only", "yes_no", "decimal", False)
+LEGACY_PRIMARY_ARM = ("single_user", "yes_no", "decimal", False)
 CHOICES = ("left", "right", "tie")
 COLORS = {"left": "#2878B5", "right": "#D55E00", "tie": "#3A923A"}
 
@@ -444,12 +445,12 @@ def plot_robustness(
     all_results: list[dict[str, Any]], primary: list[dict[str, Any]]
 ) -> dict[str, Any]:
     base = {(row["example_id"], row["probe"]["probe_id"]): row for row in primary}
+    transcript_format = primary[0]["transcript_format"]
     names = {
-        ("alternating", "yes_no", "decimal", False): "Alternating roles",
-        ("single_user", "symbols", "decimal", False): "KET/ZOG",
-        ("single_user", "true_false", "decimal", False): "TRUE/FALSE",
-        ("single_user", "yes_no", "fraction", False): "Fraction r",
-        ("single_user", "yes_no", "percent", False): "Percent r",
+        (transcript_format, "symbols", "decimal", False): "KET/ZOG",
+        (transcript_format, "true_false", "decimal", False): "TRUE/FALSE",
+        (transcript_format, "yes_no", "fraction", False): "Fraction r",
+        (transcript_format, "yes_no", "percent", False): "Percent r",
     }
     labels = []
     accuracies = []
@@ -646,6 +647,8 @@ def main() -> None:
         for row in load_jsonl(controlled_root / filename)
     }
     primary = [row for row in all_results if arm_key(row) == PRIMARY_ARM]
+    if not primary:
+        primary = [row for row in all_results if arm_key(row) == LEGACY_PRIMARY_ARM]
     notebook1 = load_jsonl(
         ARTIFACT_ROOT / "minimal_noisy_source" / "qwen_counterbalanced_results.jsonl"
     )

@@ -10,10 +10,12 @@ from mats_experiments.controlled_posterior import (
     ExperimentConfig,
     N8Config,
     Observation,
+    build_elicitation_controls,
     build_ladder_examples,
     build_n8_examples,
     candidate_match_count,
     exact_posterior,
+    messages_for_elicitation,
     messages_for_probe,
 )
 
@@ -106,19 +108,28 @@ def test_probe_orientation_is_an_exact_counterfactual() -> None:
     assert forward.target_log_odds == pytest.approx(-reverse.target_log_odds)
 
 
-def test_single_user_and_alternating_formats_preserve_evidence() -> None:
+def test_probe_is_one_complete_user_message() -> None:
     example = build_ladder_examples(ExperimentConfig(world_count=1))[0]
     probe = example.probes[0]
-    single = messages_for_probe(example, probe, LABEL_ASSIGNMENTS[0])
-    alternating = messages_for_probe(
-        example, probe, LABEL_ASSIGNMENTS[0], transcript_format="alternating"
-    )
+    messages = messages_for_probe(example, probe, LABEL_ASSIGNMENTS[0])
     observed_answer = example.observations[0].answer
 
-    assert observed_answer in single[-1]["content"]
-    assert any(observed_answer in message["content"] for message in alternating)
-    assert single[-1]["content"].endswith("Reply with exactly A, B, or C.")
-    assert alternating[-1]["content"].endswith("Reply with exactly A, B, or C.")
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert "hidden-secret inference game" in messages[0]["content"]
+    assert "OBSERVATIONS:" in messages[0]["content"]
+    assert observed_answer in messages[0]["content"]
+    assert messages[0]["content"].endswith("Reply with exactly A, B, or C.")
+
+
+def test_elicitation_control_is_one_complete_user_message() -> None:
+    control = build_elicitation_controls()[0]
+    messages = messages_for_elicitation(control, LABEL_ASSIGNMENTS[0])
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert "greater weight, or equality" in messages[0]["content"]
+    assert messages[0]["content"].endswith("Reply with exactly A, B, or C.")
 
 
 def test_endpoint_diagnostics_omit_only_zero_evidence_histories() -> None:
