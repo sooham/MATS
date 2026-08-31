@@ -10,10 +10,16 @@ if [[ ! -f "${notebook_path}" ]]; then
 fi
 
 uv run --frozen python scripts/check_cuda.py
+uv run --frozen python -m ipykernel install \
+    --sys-prefix \
+    --name mats-cuda \
+    --display-name "Python (MATS CUDA)" >/dev/null
 echo "Running ${notebook_path} with INFERENCE_BATCH_SIZE=${INFERENCE_BATCH_SIZE}"
 uv run --frozen jupyter nbconvert \
     --to notebook \
     --execute \
     --inplace \
     --ExecutePreprocessor.timeout=-1 \
+    --ExecutePreprocessor.kernel_name=mats-cuda \
+    --ExecutePreprocessor.skip_cells_with_tag=interactive \
     "${notebook_path}"

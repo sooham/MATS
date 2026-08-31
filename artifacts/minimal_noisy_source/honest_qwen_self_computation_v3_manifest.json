@@ -1,0 +1,153 @@
+{
+  "candidate_pipeline": [
+    "Qwen answers six literal membership subquestions (two candidates x three displayed sets).",
+    "Qwen visibly labels truth/report pairs SAME or DIFFERENT and emits COUNT in forward and reverse question order.",
+    "If its two counts disagree, Qwen audits both drafts and emits the adjudicated count; evaluator uses that output even when wrong.",
+    "For 0<r<1 Qwen applies the stated monotonic match-count rule using neutral ALPHA/BETA names; endpoints use Qwen-generated positive-likelihood checks."
+  ],
+  "counterbalancing_diagnostic": {
+    "development_repeats_0_1_forward_reverse_adjudication": {
+      "accuracy": 0.96875,
+      "count_consistency": 0.953125,
+      "n": 32
+    },
+    "development_repeats_0_1_natural_order_only": {
+      "accuracy": 1.0,
+      "count_consistency": 0.984375,
+      "n": 32
+    },
+    "development_repeats_2_3_frozen_natural_order": {
+      "accuracy": 0.96875,
+      "n": 32
+    },
+    "reason_for_disabling_count_order_counterbalancing": "On development repeats 0-1, natural-order Qwen counts were 98.4375% internally consistent, reverse-order counts 95.3125%, and disagreement adjudication systematically propagated several reverse-order mistakes. Natural order improved final decisions from 31/32 to 32/32."
+  },
+  "evaluator_role": "formats raw subquestions, routes Qwen-generated text, detects equality/disagreement between Qwen outputs, parses terminal values, and scores only; it never derives memberships, match counts, likelihoods, posterior values, or corrections",
+  "generation_caps": {
+    "candidate_final": 160,
+    "count_adjudication": 320,
+    "endpoint_positive_final": 96,
+    "half_endpoint_final": 128,
+    "half_special_adjudication": 256,
+    "half_special_bin": 96,
+    "visible_count": 64
+  },
+  "half_integer_weight_summary": {
+    "development": {
+      "accuracy": 1.0,
+      "by_reliability": {
+        "0.3": 1.0,
+        "0.7": 1.0
+      },
+      "count_consistency": 0.970703125,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    },
+    "test": {
+      "accuracy": 0.9375,
+      "by_reliability": {
+        "0.3": 0.96875,
+        "0.7": 0.90625
+      },
+      "count_consistency": 0.98046875,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    },
+    "validation": {
+      "accuracy": 0.921875,
+      "by_reliability": {
+        "0.3": 0.875,
+        "0.7": 0.96875
+      },
+      "count_consistency": 0.92578125,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    }
+  },
+  "half_pipeline": {
+    "r=0.1_or_0.9": "Qwen computes all eight memberships and natural-order counts, sorts four counts per side, then applies the exact base-9 lexicographic comparison rule.",
+    "r=0.3_or_0.7": "Qwen computes all eight memberships and natural-order counts, selects integer weights from a reliability-only table, performs pairwise and side additions, then compares its totals.",
+    "r=0.5": "frozen raw-evidence symmetry probe; all candidate likelihoods are equal.",
+    "r=0_or_1": "Qwen computes all eight memberships and counts, tallies candidates with the sole nonzero-likelihood count in each half, then compares the tallies."
+  },
+  "heldout_summary": {
+    "candidate_accuracy": 1.0,
+    "half_accuracy": 0.9285714285714286,
+    "pooled_accuracy": 0.9642857142857143
+  },
+  "important_scope": "multi-call Qwen inference scaffold, not a single-prompt result",
+  "input_contract": {
+    "evidence": "raw membership sets and noisy YES/NO reports only",
+    "forbidden": "no target-derived agreement counts, summaries, posterior values, learned readouts, or evaluator-side Bayesian computation",
+    "n": 8,
+    "observations_per_transcript": 3,
+    "policy": "random_memoryless"
+  },
+  "model": "Qwen/Qwen3.5-4B",
+  "prompt_templates": {
+    "atomic_membership": "Inspect the literal set in this single membership question. Is the integer {candidate} an element of {set}? Reply with exactly YES or NO.",
+    "candidate_final_interior": "Your own previous model calls produced unverified match counts: FIRST candidate ALPHA has {first_count} matches of 3; SECOND candidate BETA has {second_count} matches of 3. The report reliability is r={r}. If 0<r<0.5, fewer matches means larger weight; if 0.5<r<1, more matches means larger weight; if r=0.5, weights tie. A means FIRST larger, B means SECOND larger, C means equal. End with FINAL: A, B, or C.",
+    "count_adjudication": "Two previous Qwen counting drafts disagree. {forward_draft} {reverse_draft} Audit them against these unverified truth/report pairs: {pairs}. Independently label Q1,Q2,Q3 SAME or DIFFERENT and count SAME. End with COUNT: 0, 1, 2, or 3.",
+    "endpoint_positive_check": "Is the integer {qwen_count} exactly equal to {special_count}? Reply exactly YES or NO.",
+    "half_endpoint_tally": "For each of these four integers, write SAME if it equals target {special_count}, otherwise DIFFERENT: {four_qwen_counts}. Then count SAME and end with COUNT: 0/1/2/3/4.",
+    "half_integer_final": "Prior Qwen stages produced total likelihood weights FIRST={a} and SECOND={b}. A=FIRST larger, B=SECOND larger, C=equal. End with FINAL: A, B, or C.",
+    "half_integer_pair_sum": "Add these two supplied integers exactly: {a} + {b}. End with SUM: {integer}.",
+    "half_integer_side_total": "Add these two Qwen-generated subtotals exactly: {a} + {b}. End with TOTAL: {integer}.",
+    "half_integer_weight_lookup": "Use this exact reliability-only lookup table: count 0 -> weight {w0}, ..., count 3 -> weight {w3}. A prior Qwen stage returned MATCH COUNT: {count}. Select the corresponding integer and end with WEIGHT: {integer}.",
+    "half_lexicographic_final": "Prior Qwen stages produced sorted FIRST={first} and sorted SECOND={second}. Compare left to right. At the first unequal position, the side with the {larger_or_smaller} integer has the larger total likelihood; if all positions match, totals tie. A=FIRST, B=SECOND, C=tie. End with FINAL: A, B, or C.",
+    "half_lexicographic_sort": "These four match counts were generated by prior Qwen stages: {counts}. Sort all four integers in {direction} order, preserving duplicates. End with SORTED {side}: followed by four actual digits.",
+    "visible_count": "Compare the two words inside each bracket. For each Q write SAME if truth and report are identical, otherwise DIFFERENT. Then count the SAME labels. {three_qwen_truth_report_pairs}. Use exactly: Q1: SAME/DIFFERENT; Q2: SAME/DIFFERENT; Q3: SAME/DIFFERENT; COUNT: 0/1/2/3."
+  },
+  "records": 1344,
+  "split_summary": {
+    "development": {
+      "candidate_accuracy": 1.0,
+      "half_accuracy": 0.9642857142857143,
+      "pooled_accuracy": 0.9821428571428571
+    },
+    "test": {
+      "candidate_accuracy": 1.0,
+      "half_accuracy": 0.9285714285714286,
+      "pooled_accuracy": 0.9642857142857143
+    },
+    "validation": {
+      "candidate_accuracy": 1.0,
+      "half_accuracy": 0.9419642857142857,
+      "pooled_accuracy": 0.9709821428571429
+    }
+  },
+  "splits": {
+    "development_repeats": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "test_repeats": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "validation_repeats": [
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "status": "v3 frozen after development repeats 0-3; specialized half probes validated on repeats 8-11; full pipeline evaluated once on final repeats 12-15",
+  "supporting_artifacts": [
+    "honest_half_lexicographic_results.jsonl",
+    "honest_half_integer_weight_results.jsonl"
+  ]
+}

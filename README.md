@@ -56,6 +56,10 @@ headlessly with:
 INFERENCE_BATCH_SIZE=24 scripts/run_notebook.sh
 ```
 
+The runner registers the project interpreter as the `mats-cuda` kernel and skips
+only cells explicitly tagged `interactive`; model inference and static analyses
+still execute. This keeps widget-only cells from blocking headless `nbconvert`.
+
 The batch size counts prompts and must be a multiple of six because every probe
 has six counterbalanced label assignments. Start at 24 on a 24 GiB GPU; try 48
 or 96 on larger GPUs, or reduce to 12 after an out-of-memory error. The notebook
@@ -105,6 +109,24 @@ The script accepts `--model`, `--revision`, `--output-dir`, `--include`, and `--
 - `notebooks/01_minimal_noisy_source.ipynb` generates scripted noisy-source transcripts, computes exact Bayesian posteriors, and evaluates Qwen3.5-4B with forced-choice candidate and half-domain probes. Its six label assignments are batched, with a CUDA-aware default and an `INFERENCE_BATCH_SIZE` override. The notebook is committed unexecuted; its model-loading and inference cells are tagged `run-when-ready`.
 - `notebooks/02_fixed_transcript_reliability_sweep.ipynb` replays an exhaustive bank of identical question/answer histories under every reliability condition, separating controlled reliability sensitivity from exact natural-distribution-weighted performance.
 - `notebooks/03_controlled_posterior_behavior.ipynb` implements the behavioral gate: an explicit elicitation control, a counterfactually paired N=2/N=4 ladder, and a 32-schedule N=8 fixed bank. Its primary continuous target is exact posterior log-odds; left/right/tie classification, surface heuristics, tie subtypes, role/vocabulary/number-format robustness, and schedule-clustered uncertainty are reported separately.
+- `notebooks/04_raw_evidence_deliberation_probe.ipynb` tests four bounded single-call generated-response probes under the same N=8, K=3 random-memoryless game. None passes the development gate; the best reaches 51.8% and never predicts the second candidate. The notebook then verifies the selected multi-call Qwen self-computation probe, which reaches 224/224 on development repeats 0–3 and 224/224 on a frozen replication using previously unused repeats 4–7. Evaluator-derived memberships, counts, likelihoods, and posterior values are never supplied to Qwen.
+
+Reproduce the frozen candidate-only self-computation result with:
+
+```bash
+uv run --frozen python scripts/run_candidate_self_computation.py \
+  --output artifacts/raw_reasoning_probe/self_computation_v4_replication_results.jsonl \
+  --manifest artifacts/raw_reasoning_probe/self_computation_v4_replication_manifest.json \
+  --repeats 4,5,6,7 \
+  --batch-size 24
+```
+
+The selected candidate method is explicitly multi-call: Qwen generates every
+membership answer, count draft/adjudication, and final comparison. For a strict
+one-message/one-continuation estimand, notebook 04's negative single-call result
+is the relevant conclusion. At exactly `r=0.5`, all candidate posteriors tie, so
+three-way argmax accuracy need not decrease even though the observations contain
+no information; posterior effect size is the appropriate entropy-sensitive target.
 
 Primary papers that materially affect experiment design or interpretation are maintained as an
 annotated ledger in [`CITATIONS.md`](CITATIONS.md).

@@ -1,0 +1,82 @@
+{
+  "evaluator_role": "formats literal subquestions and reliability-only lookup tables, routes Qwen-generated text, parses terminal values, and scores/audits; Qwen generates every membership, count, selected weight, subtotal, total, and comparison",
+  "exact_rule": "After multiplying by the common denominator 1000, candidate weights for m=0,1,2,3 are [343,147,63,27] at r=0.3 and [27,63,147,343] at r=0.7.",
+  "input_contract": {
+    "allowed_task_constants": "a reliability-only integer likelihood table derived from the stated r",
+    "evidence": "the original three raw displayed sets and noisy YES/NO reports",
+    "forbidden": "no evaluator-derived memberships, match counts, candidate-specific weights, likelihood totals, posterior values, target-derived summaries, or learned readouts"
+  },
+  "model": "Qwen/Qwen3.5-4B",
+  "prompt_templates": {
+    "atomic_membership": "Inspect the literal set in this single membership question. Is the integer {candidate} an element of {set}? Reply with exactly YES or NO.",
+    "final": "Prior Qwen stages produced total likelihood weights FIRST={a} and SECOND={b}. A=FIRST larger, B=SECOND larger, C=equal. End with FINAL: A, B, or C.",
+    "natural_order_visible_count": "Compare Q1, Q2, Q3 Qwen-generated truth/report word pairs in natural order; label SAME/DIFFERENT and end with COUNT: 0/1/2/3.",
+    "pair_sum": "Add these two supplied integers exactly: {a} + {b}. End with SUM: {integer}.",
+    "side_total": "Add these two Qwen-generated subtotals exactly: {a} + {b}. End with TOTAL: {integer}.",
+    "weight_lookup": "Use this exact reliability-only lookup table: count 0 -> weight {w0}, ..., count 3 -> weight {w3}. A prior Qwen stage returned MATCH COUNT: {count}. Select the corresponding integer and end with WEIGHT: {integer}."
+  },
+  "records": 192,
+  "scope": "half-set probes at r=0.3 and r=0.7 only; multi-call Qwen self-computation",
+  "splits": {
+    "development_repeats": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "test_repeats": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "validation_repeats": [
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "status": "selected and frozen on development repeats 0-3; validated unchanged on repeats 8-11; evaluated once on test repeats 12-15",
+  "summary": {
+    "development": {
+      "accuracy": 1.0,
+      "by_reliability": {
+        "0.3": 1.0,
+        "0.7": 1.0
+      },
+      "count_consistency": 0.970703125,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    },
+    "test": {
+      "accuracy": 0.9375,
+      "by_reliability": {
+        "0.3": 0.96875,
+        "0.7": 0.90625
+      },
+      "count_consistency": 0.98046875,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    },
+    "validation": {
+      "accuracy": 0.921875,
+      "by_reliability": {
+        "0.3": 0.875,
+        "0.7": 0.96875
+      },
+      "count_consistency": 0.92578125,
+      "membership_accuracy": 1.0,
+      "n": 64,
+      "pair_sum_consistency": 1.0,
+      "side_total_consistency": 1.0,
+      "weight_consistency": 1.0
+    }
+  }
+}

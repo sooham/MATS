@@ -1,0 +1,159 @@
+{
+  "experiment": "raw_evidence_deliberation_probe",
+  "model": "Qwen3.5-4B",
+  "game": {
+    "n": 8,
+    "k": 3,
+    "policy": "random_memoryless"
+  },
+  "input_contract": {
+    "visible": "uniform prior, reliability rule, raw membership sets/reports, candidates, generic instructions",
+    "forbidden": "evaluator-derived memberships, counts, likelihoods, posteriors, or corrections"
+  },
+  "single_call_pilot": {
+    "repeats": [
+      0
+    ],
+    "records": 224,
+    "summary": {
+      "atomic_likelihood_no_thinking": {
+        "n": 56,
+        "accuracy": 0.5178571428571429,
+        "parse_rate": 1.0,
+        "predictions": {
+          "tie": 41,
+          "2": 15
+        }
+      },
+      "silent_no_thinking": {
+        "n": 56,
+        "accuracy": 0.42857142857142855,
+        "parse_rate": 1.0,
+        "predictions": {
+          "2": 56
+        }
+      },
+      "structured_likelihood_no_thinking": {
+        "n": 56,
+        "accuracy": 0.4107142857142857,
+        "parse_rate": 1.0,
+        "predictions": {
+          "tie": 51,
+          "2": 5
+        }
+      },
+      "structured_no_thinking": {
+        "n": 56,
+        "accuracy": 0.35714285714285715,
+        "parse_rate": 1.0,
+        "predictions": {
+          "tie": 55,
+          "2": 1
+        }
+      }
+    },
+    "decision": "no variant advanced to validation or test"
+  },
+  "heldout_candidate_comparison": {
+    "baseline_older": {
+      "n": 224,
+      "accuracy": 0.4732142857142857,
+      "by_reliability": {
+        "0.0": 0.3125,
+        "0.1": 0.5625,
+        "0.3": 0.40625,
+        "0.5": 0.78125,
+        "0.7": 0.5625,
+        "0.9": 0.46875,
+        "1.0": 0.21875
+      }
+    },
+    "baseline_newer": {
+      "n": 224,
+      "accuracy": 0.33035714285714285,
+      "by_reliability": {
+        "0.0": 0.625,
+        "0.1": 0.0625,
+        "0.3": 0.0,
+        "0.5": 1.0,
+        "0.7": 0.0,
+        "0.9": 0.0,
+        "1.0": 0.625
+      }
+    },
+    "single_call_symmetry": {
+      "n": 224,
+      "accuracy": 0.59375,
+      "by_reliability": {
+        "0.0": 0.625,
+        "0.1": 0.46875,
+        "0.3": 0.4375,
+        "0.5": 1.0,
+        "0.7": 0.5625,
+        "0.9": 0.4375,
+        "1.0": 0.625
+      }
+    },
+    "qwen_self_computation": {
+      "n": 224,
+      "accuracy": 1.0,
+      "by_reliability": {
+        "0.0": 1.0,
+        "0.1": 1.0,
+        "0.3": 1.0,
+        "0.5": 1.0,
+        "0.7": 1.0,
+        "0.9": 1.0,
+        "1.0": 1.0
+      }
+    },
+    "qwen_self_computation_v4_replication": {
+      "n": 224,
+      "accuracy": 1.0,
+      "by_reliability": {
+        "0.0": 1.0,
+        "0.1": 1.0,
+        "0.3": 1.0,
+        "0.5": 1.0,
+        "0.7": 1.0,
+        "0.9": 1.0,
+        "1.0": 1.0
+      }
+    }
+  },
+  "v4_reproduction": {
+    "development_repeats": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "replication_repeats": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "development_accuracy": 1.0,
+    "replication_accuracy": 1.0,
+    "replication_parse_rate": 1.0,
+    "source_artifact": "artifacts/raw_reasoning_probe/self_computation_v4_replication_results.jsonl"
+  },
+  "selected_probe": {
+    "name": "qwen_self_computation",
+    "scope": "multi-call Qwen-generated inference scaffold",
+    "selection_repeats": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "replication_repeats": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "source_artifact": "artifacts/raw_reasoning_probe/self_computation_v4_replication_results.jsonl"
+  }
+}

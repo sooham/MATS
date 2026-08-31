@@ -1,0 +1,255 @@
+{
+  "model": "Qwen--Qwen3.5-4B",
+  "input_contract": {
+    "visible_to_model": [
+      "uniform prior and domain size",
+      "stated channel reliability",
+      "three raw membership sets and SOURCE YES/NO reports",
+      "the two candidate names",
+      "generic reasoning/format instructions"
+    ],
+    "forbidden": [
+      "evaluator-derived memberships",
+      "match counts or other sufficient statistics",
+      "likelihoods or posterior values",
+      "target-derived corrections"
+    ]
+  },
+  "protocol": {
+    "repeats": [
+      0
+    ],
+    "variants": {
+      "silent_no_thinking": {
+        "style": "silent",
+        "enable_thinking": false,
+        "max_new_tokens": 64
+      },
+      "structured_no_thinking": {
+        "style": "structured",
+        "enable_thinking": false,
+        "max_new_tokens": 160
+      },
+      "structured_likelihood_no_thinking": {
+        "style": "structured_likelihood",
+        "enable_thinking": false,
+        "max_new_tokens": 192
+      },
+      "atomic_likelihood_no_thinking": {
+        "style": "atomic_likelihood",
+        "enable_thinking": false,
+        "max_new_tokens": 256
+      }
+    },
+    "orientations": [
+      "forward"
+    ],
+    "batch_size": 12,
+    "decisions": 56,
+    "records": 224,
+    "greedy_generation": true
+  },
+  "summary": {
+    "by_variant_reliability": [
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.0,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.1,
+        "n": 8,
+        "accuracy": 0.5,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.3,
+        "n": 8,
+        "accuracy": 0.375,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.5,
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.7,
+        "n": 8,
+        "accuracy": 0.25,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 0.9,
+        "n": 8,
+        "accuracy": 0.125,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "atomic_likelihood_no_thinking",
+        "reliability": 1.0,
+        "n": 8,
+        "accuracy": 0.625,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.0,
+        "n": 8,
+        "accuracy": 0.125,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.1,
+        "n": 8,
+        "accuracy": 0.875,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.3,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.5,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.7,
+        "n": 8,
+        "accuracy": 0.5,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 0.9,
+        "n": 8,
+        "accuracy": 0.625,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "silent_no_thinking",
+        "reliability": 1.0,
+        "n": 8,
+        "accuracy": 0.125,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.0,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.1,
+        "n": 8,
+        "accuracy": 0.25,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.3,
+        "n": 8,
+        "accuracy": 0.125,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.5,
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.7,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 0.9,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_likelihood_no_thinking",
+        "reliability": 1.0,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.0,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.1,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.3,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.5,
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.7,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 0.9,
+        "n": 8,
+        "accuracy": 0.0,
+        "parse_rate": 1.0
+      },
+      {
+        "variant": "structured_no_thinking",
+        "reliability": 1.0,
+        "n": 8,
+        "accuracy": 0.75,
+        "parse_rate": 1.0
+      }
+    ],
+    "orientation_pairs": 0,
+    "paired_accuracy": null,
+    "orientation_consistency": null
+  }
+}

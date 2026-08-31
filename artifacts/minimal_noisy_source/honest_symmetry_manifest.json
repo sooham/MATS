@@ -1,0 +1,104 @@
+{
+  "aggregation": "mean conditional log probability for each semantic answer, followed by argmax",
+  "base_prompt": "newer",
+  "candidate_component": {
+    "answer_label_assignments": [
+      [
+        "left",
+        "right",
+        "tie"
+      ],
+      [
+        "right",
+        "tie",
+        "left"
+      ],
+      [
+        "tie",
+        "left",
+        "right"
+      ]
+    ],
+    "observation_orders": [
+      [
+        0,
+        1,
+        2
+      ]
+    ],
+    "presentations_per_decision": 24,
+    "probe_kind": "candidate",
+    "value_permutations": "all 8 cyclic rotations of labels 1..8"
+  },
+  "half_component": {
+    "answer_label_assignments": [
+      [
+        "left",
+        "right",
+        "tie"
+      ],
+      [
+        "right",
+        "tie",
+        "left"
+      ],
+      [
+        "tie",
+        "left",
+        "right"
+      ]
+    ],
+    "observation_orders": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        1,
+        2,
+        0
+      ],
+      [
+        2,
+        0,
+        1
+      ]
+    ],
+    "presentations_per_decision": 9,
+    "probe_kind": "half",
+    "value_permutations": [
+      "identity"
+    ]
+  },
+  "input_contract": {
+    "evidence": "raw membership sets and noisy YES/NO reports only",
+    "forbidden": "no target-derived agreement counts, summaries, posterior values, learned readouts, or evaluator-side Bayesian computation",
+    "n": 8,
+    "observations_per_transcript": 3,
+    "policy": "random_memoryless"
+  },
+  "model": "Qwen/Qwen3.5-4B",
+  "records": 1344,
+  "splits": {
+    "development_repeats": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "test_repeats": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "validation_repeats": [
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "status": "selected on development repeats 0-3 and validation repeats 8-11; evaluated once on test repeats 12-15"
+}
