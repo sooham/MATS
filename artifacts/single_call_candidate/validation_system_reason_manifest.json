@@ -1,0 +1,75 @@
+{
+  "model": "Qwen--Qwen3.5-4B",
+  "scope": "candidate-only, exactly one Qwen continuation per transcript",
+  "game": {
+    "n": 8,
+    "k": 3,
+    "policy": "random_memoryless"
+  },
+  "split": {
+    "repeats": [
+      1
+    ],
+    "per_reliability_limit": null
+  },
+  "variant": {
+    "name": "number_system_reason",
+    "reasoning_mode": "concise",
+    "max_new_tokens": 1024,
+    "filler_tokens": 0,
+    "use_system_message": true,
+    "enable_thinking": false
+  },
+  "input_contract": {
+    "visible": "public rules, raw membership questions/reports, candidate identities",
+    "withheld": "truthful answers, channel coins, evaluator memberships/counts, likelihoods, posteriors, and target labels",
+    "orientation": "SHA-256(example_id), independent of scoring target"
+  },
+  "summary": {
+    "records": 56,
+    "accuracy": 0.8392857142857143,
+    "parse_rate": 1.0,
+    "prediction_counts": {
+      "2": 21,
+      "7": 13,
+      "tie": 22
+    },
+    "by_reliability": {
+      "0.0": {
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.1": {
+        "n": 8,
+        "accuracy": 0.875,
+        "parse_rate": 1.0
+      },
+      "0.3": {
+        "n": 8,
+        "accuracy": 0.5,
+        "parse_rate": 1.0
+      },
+      "0.5": {
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.7": {
+        "n": 8,
+        "accuracy": 0.875,
+        "parse_rate": 1.0
+      },
+      "0.9": {
+        "n": 8,
+        "accuracy": 0.625,
+        "parse_rate": 1.0
+      },
+      "1.0": {
+        "n": 8,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      }
+    }
+  }
+}
