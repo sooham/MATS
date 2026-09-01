@@ -1,0 +1,308 @@
+{
+  "model": "Qwen--Qwen3.5-4B",
+  "scope": "causal alias swap and layerwise filler logit lens",
+  "selection": {
+    "n": 32,
+    "reliabilities": [
+      0.1,
+      0.3,
+      0.7,
+      0.9
+    ],
+    "examples_per_reliability": 4,
+    "base_examples": 16
+  },
+  "protocol": {
+    "fillers": {
+      "underscore": {
+        "surface": "_",
+        "token_id": 62
+      },
+      "period": {
+        "surface": ".",
+        "token_id": 13
+      }
+    },
+    "filler_counts": [
+      0,
+      1,
+      2,
+      4,
+      8,
+      11,
+      16,
+      32,
+      64,
+      100
+    ],
+    "alias_conditions": [
+      "original",
+      "swapped"
+    ],
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32
+    ],
+    "answer_token_ids": {
+      "X": 55,
+      "Y": 56,
+      "=": 28
+    },
+    "enable_thinking": false,
+    "generated_reasoning_tokens": 0
+  },
+  "summary": {
+    "layer_records": 21120,
+    "final_conditions": [
+      {
+        "filler": "period",
+        "filler_count": 0,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "X": 2,
+          "Y": 30
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "period",
+        "filler_count": 1,
+        "records": 32,
+        "surface_accuracy": 0.375,
+        "prediction_counts": {
+          "=": 10,
+          "Y": 22
+        },
+        "alias_swap_semantic_consistency": 0.0625
+      },
+      {
+        "filler": "period",
+        "filler_count": 2,
+        "records": 32,
+        "surface_accuracy": 0.375,
+        "prediction_counts": {
+          "=": 9,
+          "Y": 23
+        },
+        "alias_swap_semantic_consistency": 0.0625
+      },
+      {
+        "filler": "period",
+        "filler_count": 4,
+        "records": 32,
+        "surface_accuracy": 0.40625,
+        "prediction_counts": {
+          "=": 7,
+          "X": 1,
+          "Y": 24
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "period",
+        "filler_count": 8,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "=": 3,
+          "X": 3,
+          "Y": 26
+        },
+        "alias_swap_semantic_consistency": 0.25
+      },
+      {
+        "filler": "period",
+        "filler_count": 11,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "=": 1,
+          "X": 2,
+          "Y": 29
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "period",
+        "filler_count": 16,
+        "records": 32,
+        "surface_accuracy": 0.53125,
+        "prediction_counts": {
+          "=": 1,
+          "X": 3,
+          "Y": 28
+        },
+        "alias_swap_semantic_consistency": 0.1875
+      },
+      {
+        "filler": "period",
+        "filler_count": 32,
+        "records": 32,
+        "surface_accuracy": 0.40625,
+        "prediction_counts": {
+          "=": 6,
+          "X": 1,
+          "Y": 25
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "period",
+        "filler_count": 64,
+        "records": 32,
+        "surface_accuracy": 0.4375,
+        "prediction_counts": {
+          "=": 7,
+          "Y": 25
+        },
+        "alias_swap_semantic_consistency": 0.0625
+      },
+      {
+        "filler": "period",
+        "filler_count": 100,
+        "records": 32,
+        "surface_accuracy": 0.4375,
+        "prediction_counts": {
+          "=": 4,
+          "X": 1,
+          "Y": 27
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 0,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "X": 2,
+          "Y": 30
+        },
+        "alias_swap_semantic_consistency": 0.125
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 1,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 2,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 4,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 8,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 11,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 16,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 32,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 64,
+        "records": 32,
+        "surface_accuracy": 0.5,
+        "prediction_counts": {
+          "Y": 32
+        },
+        "alias_swap_semantic_consistency": 0.0
+      },
+      {
+        "filler": "underscore",
+        "filler_count": 100,
+        "records": 32,
+        "surface_accuracy": 0.46875,
+        "prediction_counts": {
+          "X": 1,
+          "Y": 31
+        },
+        "alias_swap_semantic_consistency": 0.0625
+      }
+    ]
+  }
+}

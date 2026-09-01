@@ -111,6 +111,9 @@ The script accepts `--model`, `--revision`, `--output-dir`, `--include`, and `--
 - `notebooks/03_controlled_posterior_behavior.ipynb` implements the behavioral gate: an explicit elicitation control, a counterfactually paired N=2/N=4 ladder, and a 32-schedule N=8 fixed bank. Its primary continuous target is exact posterior log-odds; left/right/tie classification, surface heuristics, tie subtypes, role/vocabulary/number-format robustness, and schedule-clustered uncertainty are reported separately.
 - `notebooks/04_raw_evidence_deliberation_probe.ipynb` records an earlier failed single-call search and a historical multi-stage scaffold. The multi-stage result is excluded from the current estimand.
 - `notebooks/05_single_call_candidate_probe.ipynb` develops the replacement candidate-number readout under the same N=8, K=3 random-memoryless game. It uses exactly one no-thinking Qwen continuation per transcript and only public rules plus raw questions/reports. The frozen method scores 52/56 on development, 47/56 on validation, and 107/112 (95.5%) on held-out repeats 2–3 with 100% parse compliance.
+- `notebooks/06_exact_filler_token_sweep.ipynb` evaluates exact token-ID filler prefixes for every F=0–100 across five single-token identities, then reports one frozen repeat-1 validation condition.
+- `notebooks/07_scaled_filler_grid.ipynb` crosses eight domain sizes with all eleven reliability values while exactly counterbalancing candidate order and X/Y answer aliases within each cell.
+- `notebooks/08_filler_alias_mechanism.ipynb` uses a causal X/Y alias swap and a 33-depth logit lens to distinguish semantic candidate selection from answer-token bias.
 
 Reproduce the frozen single-call held-out result with:
 
