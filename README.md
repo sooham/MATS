@@ -147,3 +147,7 @@ posterior effect size is the appropriate entropy-sensitive target.
 
 Primary papers that materially affect experiment design or interpretation are maintained as an
 annotated ledger in [`CITATIONS.md`](CITATIONS.md).
+
+The proposed mechanistic follow-up—three ranked hypotheses, exact causal interventions, failure
+criteria, and an RTX-5090/Qwen3.5 execution plan—is in
+[`reports/research_agenda/REPORT.md`](reports/research_agenda/REPORT.md).
