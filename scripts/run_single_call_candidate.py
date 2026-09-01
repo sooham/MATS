@@ -44,9 +44,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", choices=sorted(VARIANTS), required=True)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
+        "--batch-by-reliability",
+        action="store_true",
+        help=(
+            "Group equal-reliability examples before batching. This changes only "
+            "execution order and is useful when generation lengths differ by reliability."
+        ),
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         help="Override the variant generation cap (intended for diagnostic smoke runs).",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help=(
+            "Enable the checkpoint's native thinking chat-template mode. The "
+            "--max-new-tokens value remains the total continuation cap."
+        ),
     )
     parser.add_argument(
         "--max-gpu-memory-gib",
@@ -125,6 +141,8 @@ def main() -> None:
         load_candidate_decisions(args.transcripts, repeats=repeats),
         args.per_reliability_limit,
     )
+    if args.batch_by_reliability:
+        decisions.sort(key=lambda decision: (float(decision.reliability), decision.example_id))
     if not decisions:
         raise RuntimeError("No candidate decisions matched the requested split.")
     variant = VARIANTS[args.variant]
@@ -156,13 +174,21 @@ def main() -> None:
             processor=processor,
             device=device,
             messages_batch=messages_batch,
-            enable_thinking=False,
+            enable_thinking=args.enable_thinking,
             max_new_tokens=max_new_tokens,
         )
         for decision, messages, response in zip(batch, messages_batch, responses):
             generated_text = str(response["generated_text"])
+            thinking_completed = (
+                not args.enable_thinking or "</think>" in generated_text
+            )
+            answer_text = (
+                generated_text.rsplit("</think>", 1)[-1]
+                if thinking_completed
+                else ""
+            )
             predicted = parse_candidate_number(
-                generated_text,
+                answer_text,
                 candidates=(decision.left_candidate, decision.right_candidate),
             )
             target = normative_absolute(decision)
@@ -180,8 +206,14 @@ def main() -> None:
                     "candidates": [decision.left_candidate, decision.right_candidate],
                     "presentation_order": list(candidate_order(decision)),
                     "variant": args.variant,
+                    "enable_thinking": args.enable_thinking,
+                    "max_new_tokens": max_new_tokens,
                     "messages": messages,
                     "generated_text": generated_text,
+                    "generated_token_count": response["generated_token_count"],
+                    "reached_eos": response["reached_eos"],
+                    "hit_max_new_tokens": response["hit_max_new_tokens"],
+                    "thinking_completed": thinking_completed,
                     "predicted_absolute": predicted,
                     "normative_absolute": target,
                     "parse_success": predicted is not None,
@@ -196,12 +228,16 @@ def main() -> None:
         "model": loaded.metadata,
         "scope": "candidate-only, exactly one Qwen continuation per transcript",
         "game": {"n": 8, "k": 3, "policy": "random_memoryless"},
-        "split": {"repeats": repeats, "per_reliability_limit": args.per_reliability_limit},
+        "split": {
+            "repeats": repeats,
+            "per_reliability_limit": args.per_reliability_limit,
+            "batch_by_reliability": args.batch_by_reliability,
+        },
         "variant": {
             "name": args.variant,
             **variant.__dict__,
             "effective_max_new_tokens": max_new_tokens,
-            "enable_thinking": False,
+            "enable_thinking": args.enable_thinking,
         },
         "input_contract": {
             "visible": "public rules, raw membership questions/reports, candidate identities",

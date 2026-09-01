@@ -172,12 +172,32 @@ def generate_responses_batch(
         )
     continuation_ids = generated[:, input_ids.shape[1] :]
     texts = processor.tokenizer.batch_decode(continuation_ids, skip_special_tokens=True)
+    raw_eos_ids = getattr(model.generation_config, "eos_token_id", None)
+    if raw_eos_ids is None:
+        raw_eos_ids = processor.tokenizer.eos_token_id
+    eos_ids = {
+        int(token_id)
+        for token_id in (
+            raw_eos_ids if isinstance(raw_eos_ids, (list, tuple)) else [raw_eos_ids]
+        )
+        if token_id is not None
+    }
     records: list[dict[str, object]] = []
-    for text in texts:
+    for text, token_row in zip(texts, continuation_ids.tolist()):
+        stop_index = next(
+            (index for index, token_id in enumerate(token_row) if token_id in eos_ids),
+            None,
+        )
+        generated_token_count = stop_index if stop_index is not None else len(token_row)
         label_matches = re.findall(r"(?<![A-Z])([ABC])(?![A-Z])", text.upper())
         records.append(
             {
                 "generated_text": text,
+                "generated_token_count": generated_token_count,
+                "reached_eos": stop_index is not None,
+                "hit_max_new_tokens": (
+                    stop_index is None and generated_token_count == max_new_tokens
+                ),
                 "parsed_label": label_matches[-1] if label_matches else None,
                 "parse_success": bool(label_matches),
             }
