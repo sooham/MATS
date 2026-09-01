@@ -85,7 +85,7 @@ INFERENCE_BATCH_SIZE=48 scripts/run_notebook.sh notebooks/03_controlled_posterio
 Set `RUN_THINKING_ARM=1` to additionally generate the separately reported deliberative
 one-observation capability arm.
 
-## Download Qwen3.5-4B
+## Download Qwen3.5 checkpoints
 
 After `hf auth login`, the script can use your local Hugging Face login cache. Alternatively, export a read token in the shell. Do not put the token in a file tracked by Git:
 
@@ -96,13 +96,26 @@ export HF_TOKEN="hf_..."
 uv run --frozen python scripts/download_model.py
 ```
 
-The default destination is `models/Qwen--Qwen3.5-4B/`, which is ignored by Git. For exact replication, replace `main` with the immutable commit hash shown on the model's Hugging Face page:
+The default destination is `models/Qwen--Qwen3.5-4B/`, which is ignored by Git. For exact replication, replace `main` with an immutable commit hash:
 
 ```bash
 uv run --frozen python scripts/download_model.py --revision <commit-hash>
 ```
 
-The script accepts `--model`, `--revision`, `--output-dir`, `--include`, and `--exclude`, so later experiments can reuse it for other repositories or smaller file subsets. It passes the token directly to `snapshot_download`, enables the faster transfer backend when available, and resumes safely through the Hugging Face cache.
+The pinned model-size study uses dense 4B and 9B BF16 checkpoints plus the official
+27B GPTQ-Int4 checkpoint. List or download the entire set with:
+
+```bash
+uv run --frozen python scripts/download_model.py --list-model-sets
+uv run --frozen python scripts/download_model.py --model-set qwen3.5-size-study
+```
+
+Every completed download records the requested and resolved revisions in
+`.mats_model_snapshot.json` inside its model directory. The script also accepts
+`--model`, `--revision`, `--output-dir`, `--include`, and `--exclude` for a single
+repository or a smaller file subset. It passes the token directly to
+`snapshot_download`, enables the faster transfer backend when available, and
+resumes safely through the Hugging Face cache.
 
 ## Experiments
 
@@ -114,6 +127,7 @@ The script accepts `--model`, `--revision`, `--output-dir`, `--include`, and `--
 - `notebooks/06_exact_filler_token_sweep.ipynb` evaluates exact token-ID filler prefixes for every F=0–100 across five single-token identities, then reports one frozen repeat-1 validation condition.
 - `notebooks/07_scaled_filler_grid.ipynb` crosses eight domain sizes with all eleven reliability values while exactly counterbalancing candidate order and X/Y answer aliases within each cell.
 - `notebooks/08_filler_alias_mechanism.ipynb` uses a causal X/Y alias swap and a 33-depth logit lens to distinguish semantic candidate selection from answer-token bias.
+- `notebooks/09_qwen35_model_size_comparison.ipynb` compares the frozen notebook-05 prompt, the full notebook-06 filler grid, and a held-out zero-scratchpad `F=0` readout across pinned Qwen3.5-4B, Qwen3.5-9B, and Qwen3.5-27B-GPTQ-Int4 checkpoints.
 
 Reproduce the frozen single-call held-out result with:
 

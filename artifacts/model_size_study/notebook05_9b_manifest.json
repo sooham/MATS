@@ -1,0 +1,96 @@
+{
+  "model": {
+    "model_id": "Qwen/Qwen3.5-9B",
+    "requested_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "resolved_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "local_path": "models/Qwen--Qwen3.5-9B",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "model_type": "qwen3_5",
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "quantization_config": null,
+    "loader_backend": "transformers",
+    "gpu_resident_transformer_layers": null,
+    "load_dtype": "torch.bfloat16",
+    "max_gpu_memory_gib": null,
+    "max_cpu_memory_gib": 700,
+    "input_device": "cuda:0",
+    "device_map_summary": {
+      "cuda:0": 1
+    }
+  },
+  "scope": "candidate-only, exactly one Qwen continuation per transcript",
+  "game": {
+    "n": 8,
+    "k": 3,
+    "policy": "random_memoryless"
+  },
+  "split": {
+    "repeats": [
+      2,
+      3
+    ],
+    "per_reliability_limit": null
+  },
+  "variant": {
+    "name": "number_system_reason",
+    "reasoning_mode": "concise",
+    "max_new_tokens": 1024,
+    "filler_tokens": 0,
+    "use_system_message": true,
+    "effective_max_new_tokens": 1024,
+    "enable_thinking": false
+  },
+  "input_contract": {
+    "visible": "public rules, raw membership questions/reports, candidate identities",
+    "withheld": "truthful answers, channel coins, evaluator memberships/counts, likelihoods, posteriors, and target labels",
+    "orientation": "SHA-256(example_id), independent of scoring target"
+  },
+  "summary": {
+    "records": 112,
+    "accuracy": 0.9732142857142857,
+    "parse_rate": 1.0,
+    "prediction_counts": {
+      "2": 32,
+      "7": 29,
+      "tie": 51
+    },
+    "by_reliability": {
+      "0.0": {
+        "n": 16,
+        "accuracy": 0.8125,
+        "parse_rate": 1.0
+      },
+      "0.1": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.3": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.5": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.7": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "0.9": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      },
+      "1.0": {
+        "n": 16,
+        "accuracy": 1.0,
+        "parse_rate": 1.0
+      }
+    }
+  }
+}

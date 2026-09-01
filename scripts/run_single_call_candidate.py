@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from mats_experiments.model_loading import load_qwen
 from mats_experiments.qwen_scoring import generate_responses_batch
 from mats_experiments.raw_reasoning_probe import (
     CandidateDecision,
@@ -42,6 +43,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", default="0")
     parser.add_argument("--variant", choices=sorted(VARIANTS), required=True)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        help="Override the variant generation cap (intended for diagnostic smoke runs).",
+    )
+    parser.add_argument(
+        "--max-gpu-memory-gib",
+        type=float,
+        help="Use Accelerate device mapping and cap this process's GPU weight allocation.",
+    )
+    parser.add_argument("--max-cpu-memory-gib", type=float, default=700)
+    parser.add_argument(
+        "--gptq-backend",
+        default="gptq_torch",
+        help="GPTQModel backend value (default: gptq_torch).",
+    )
     parser.add_argument(
         "--per-reliability-limit",
         type=int,
@@ -111,20 +128,24 @@ def main() -> None:
     if not decisions:
         raise RuntimeError("No candidate decisions matched the requested split.")
     variant = VARIANTS[args.variant]
+    max_new_tokens = (
+        variant.max_new_tokens
+        if args.max_new_tokens is None
+        else args.max_new_tokens
+    )
+    if max_new_tokens < 1:
+        raise ValueError("--max-new-tokens must be positive.")
 
-    import torch
-    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("This experiment requires CUDA.")
-    device = torch.device("cuda")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
-    processor.tokenizer.padding_side = "left"
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        args.model_path, dtype=dtype, local_files_only=True
-    ).to(device)
-    model.eval()
+    loaded = load_qwen(
+        model_path=args.model_path,
+        max_gpu_memory_gib=args.max_gpu_memory_gib,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        gptq_backend=args.gptq_backend,
+    )
+    model = loaded.model
+    processor = loaded.processor
+    device = loaded.input_device
+    print(f"Model load: {json.dumps(loaded.metadata, sort_keys=True)}", flush=True)
 
     rows: list[dict[str, object]] = []
     for start in range(0, len(decisions), args.batch_size):
@@ -136,7 +157,7 @@ def main() -> None:
             device=device,
             messages_batch=messages_batch,
             enable_thinking=False,
-            max_new_tokens=variant.max_new_tokens,
+            max_new_tokens=max_new_tokens,
         )
         for decision, messages, response in zip(batch, messages_batch, responses):
             generated_text = str(response["generated_text"])
@@ -172,11 +193,16 @@ def main() -> None:
 
     summary = _summarize(rows)
     manifest = {
-        "model": args.model_path.name,
+        "model": loaded.metadata,
         "scope": "candidate-only, exactly one Qwen continuation per transcript",
         "game": {"n": 8, "k": 3, "policy": "random_memoryless"},
         "split": {"repeats": repeats, "per_reliability_limit": args.per_reliability_limit},
-        "variant": {"name": args.variant, **variant.__dict__, "enable_thinking": False},
+        "variant": {
+            "name": args.variant,
+            **variant.__dict__,
+            "effective_max_new_tokens": max_new_tokens,
+            "enable_thinking": False,
+        },
         "input_contract": {
             "visible": "public rules, raw membership questions/reports, candidate identities",
             "withheld": (

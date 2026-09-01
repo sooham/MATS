@@ -21,6 +21,7 @@ from mats_experiments.filler_token_probe import (
     render_n8_messages,
     verify_single_token,
 )
+from mats_experiments.model_loading import load_qwen
 from mats_experiments.raw_reasoning_probe import load_candidate_decisions, normative_absolute
 
 
@@ -41,6 +42,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--f-min", type=int, default=0)
     parser.add_argument("--f-max", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--max-gpu-memory-gib",
+        type=float,
+        help="Use Accelerate device mapping and cap this process's GPU weight allocation.",
+    )
+    parser.add_argument("--max-cpu-memory-gib", type=float, default=700)
+    parser.add_argument(
+        "--gptq-backend",
+        default="gptq_torch",
+        help="GPTQModel backend value (default: gptq_torch).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -52,6 +64,12 @@ def parse_csv(value: str) -> list[str]:
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, allow_nan=False) + "\n")
+
+
+def append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
 
@@ -118,15 +136,16 @@ def main() -> None:
     }
 
     import torch
-    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required.")
-    device = torch.device("cuda")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
+    loaded = load_qwen(
+        model_path=args.model_path,
+        max_gpu_memory_gib=args.max_gpu_memory_gib,
+        max_cpu_memory_gib=args.max_cpu_memory_gib,
+        gptq_backend=args.gptq_backend,
+    )
+    model = loaded.model
+    processor = loaded.processor
+    device = loaded.input_device
     tokenizer = processor.tokenizer
-    tokenizer.padding_side = "left"
     filler_ids = {
         name: verify_single_token(tokenizer, FILLER_SURFACES[name]) for name in fillers
     }
@@ -136,10 +155,7 @@ def main() -> None:
     answer_ids = {
         surface: verify_single_token(tokenizer, surface) for surface in ("2", "7", "=")
     }
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        args.model_path, dtype=dtype, local_files_only=True
-    ).to(device)
-    model.eval()
+    print(f"Model load: {json.dumps(loaded.metadata, sort_keys=True)}", flush=True)
 
     jobs = []
     for filler_count in range(args.f_min, args.f_max + 1):
@@ -155,6 +171,7 @@ def main() -> None:
     )
 
     rows = list(existing)
+    write_jsonl(args.output, rows)
     pad_id = int(tokenizer.pad_token_id)
     for start in range(0, len(jobs), args.batch_size):
         batch = jobs[start : start + args.batch_size]
@@ -188,10 +205,12 @@ def main() -> None:
                 logits_to_keep=1,
             ).logits[:, -1, :].float()
         option_id_tensor = torch.tensor(
-            [answer_ids[surface] for surface in ("2", "7", "=")], device=device
+            [answer_ids[surface] for surface in ("2", "7", "=")],
+            device=logits.device,
         )
         option_logits = logits.index_select(-1, option_id_tensor).cpu()
         option_log_probs = option_logits.log_softmax(-1)
+        batch_rows = []
         for (decision, filler, filler_count), messages, sequence, values, log_probs in zip(
             batch,
             messages_batch,
@@ -206,7 +225,7 @@ def main() -> None:
             )
             target_absolute = normative_absolute(decision)
             target_surface = n8_target_surface(decision)
-            rows.append(
+            batch_rows.append(
                 {
                     "example_id": decision.example_id,
                     "repeat": decision.repeat,
@@ -236,7 +255,8 @@ def main() -> None:
                     "single_call": True,
                 }
             )
-        write_jsonl(args.output, rows)
+        rows.extend(batch_rows)
+        append_jsonl(args.output, batch_rows)
         if start == 0 or (start + len(batch)) % (args.batch_size * 20) == 0:
             print(f"completed {start + len(batch)}/{len(jobs)}", flush=True)
 
@@ -244,7 +264,7 @@ def main() -> None:
     write_jsonl(args.output, rows)
     result_summary = summary(rows)
     manifest = {
-        "model": args.model_path.name,
+        "model": loaded.metadata,
         "scope": "immediate one-token answer after token-exact filler and FINAL prefix",
         "game": {"n": 8, "k": 3, "policy": "random_memoryless", "candidates": [2, 7]},
         "split": {"repeats": repeats},

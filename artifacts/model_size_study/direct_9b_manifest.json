@@ -1,0 +1,82 @@
+{
+  "model": {
+    "model_id": "Qwen/Qwen3.5-9B",
+    "requested_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "resolved_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "local_path": "models/Qwen--Qwen3.5-9B",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "model_type": "qwen3_5",
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "quantization_config": null,
+    "loader_backend": "transformers",
+    "gpu_resident_transformer_layers": null,
+    "load_dtype": "torch.bfloat16",
+    "max_gpu_memory_gib": 15.0,
+    "max_cpu_memory_gib": 700,
+    "input_device": "cuda:0",
+    "device_map_summary": {
+      "0": 27,
+      "cpu": 10
+    }
+  },
+  "scope": "immediate one-token answer after token-exact filler and FINAL prefix",
+  "game": {
+    "n": 8,
+    "k": 3,
+    "policy": "random_memoryless",
+    "candidates": [
+      2,
+      7
+    ]
+  },
+  "split": {
+    "repeats": [
+      2,
+      3
+    ]
+  },
+  "protocol": {
+    "fillers": {
+      "period": {
+        "surface": ".",
+        "token_id": 13
+      }
+    },
+    "f_min": 0,
+    "f_max": 0,
+    "final_prefix": "FINAL: ",
+    "final_prefix_token_ids": [
+      95429,
+      25,
+      220
+    ],
+    "answer_token_ids": {
+      "2": 17,
+      "7": 22,
+      "=": 28
+    },
+    "enable_thinking": false,
+    "generated_reasoning_tokens": 0,
+    "batch_size": 8
+  },
+  "input_contract": "public rules, raw questions/reports, candidates; no evaluator-derived evidence",
+  "summary": {
+    "records": 112,
+    "conditions": [
+      {
+        "filler": "period",
+        "filler_count": 0,
+        "n": 112,
+        "accuracy": 0.29464285714285715,
+        "candidate_only_accuracy": 0.55,
+        "candidate_2_accuracy": 0.45161290322580644,
+        "candidate_7_accuracy": 0.6551724137931034,
+        "prediction_counts": {
+          "2": 47,
+          "7": 65
+        }
+      }
+    ]
+  }
+}

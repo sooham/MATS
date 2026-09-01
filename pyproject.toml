@@ -5,6 +5,8 @@ description = "Experiments in mechanistic interpretability of language models"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+    "accelerate>=1.14",
+    "gptqmodel>=5.8",
     "huggingface-hub>=0.30",
     "matplotlib>=3.8",
     "torch==2.11.0",
