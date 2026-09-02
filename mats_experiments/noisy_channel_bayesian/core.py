@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import random
 import re
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,12 @@ from typing import Any, Literal
 SCHEMA_VERSION = "1.0"
 YES = "YES"
 NO = "NO"
+
+# Qwen returns unnormalized pre-softmax scores, so individual raw logits do not
+# have a logarithm base.  PyTorch's softmax uses exp(), however, which makes
+# log-probabilities and logit differences natural-log quantities (nats).
+SOFTMAX_LOG_BASE = "e"
+SOFTMAX_LOG_UNIT = "nats"
 
 
 def as_fraction(value: float | str | Fraction) -> Fraction:
@@ -38,6 +45,20 @@ def as_fraction(value: float | str | Fraction) -> Fraction:
 
 def fraction_text(value: Fraction) -> str:
     return f"{value.numerator}/{value.denominator}"
+
+
+def natural_log_ratio(numerator: Fraction, denominator: Fraction) -> float:
+    """Return ln(numerator / denominator) on PyTorch softmax's logit scale.
+
+    Computing the two integer logarithms separately preserves the exact rational
+    ratio until the final floating-point operation and avoids an intermediate
+    ``float(Fraction)`` overflow for unusually large exact values.
+    """
+
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError("A finite natural-log ratio requires positive values.")
+    ratio = numerator / denominator
+    return math.log(ratio.numerator) - math.log(ratio.denominator)
 
 
 @dataclass(frozen=True)
@@ -166,6 +187,7 @@ class XVsYPosteriorProbe:
     reasoning_budget: int = 0
     allow_same: bool = False
     call_layout: CallLayout = "conversation"
+    answer_prefix: str = "ANSWER:"
 
     def validate(self, n: int) -> None:
         if self.x == self.y:
@@ -176,6 +198,14 @@ class XVsYPosteriorProbe:
             raise ValueError("reasoning_budget must be non-negative.")
         if self.call_layout not in ("conversation", "replay_user"):
             raise ValueError("call_layout must be 'conversation' or 'replay_user'.")
+        if (
+            not self.answer_prefix
+            or self.answer_prefix != self.answer_prefix.strip()
+            or "\n" in self.answer_prefix
+        ):
+            raise ValueError(
+                "answer_prefix must be non-empty, single-line, and have no surrounding whitespace."
+            )
 
 
 @dataclass(frozen=True)
@@ -380,11 +410,24 @@ def render_candidate_evidence_prompt(
             )
         lines.append("")
     choices = f"{probe.x} or {probe.y}" + (" or SAME" if probe.allow_same else "")
+    allowed_values = [str(probe.x), str(probe.y)] + (["SAME"] if probe.allow_same else [])
+    allowed_responses = " | ".join(
+        f"{probe.answer_prefix}{value}" for value in allowed_values
+    )
     lines.extend(
         [
             "Which candidate has greater posterior probability after all observations?",
-            f"Reply with exactly {choices}.",
-            "ANSWER:",
+            f"The decision value must be exactly one of: {choices}.",
+            *(
+                ["If the two posterior probabilities are equal, the required value is SAME."]
+                if probe.allow_same
+                else []
+            ),
+            "Do not provide reasoning, explanation, calculations, or intermediate work.",
+            (
+                f"Output exactly one of: {allowed_responses}. Do not include any other text "
+                "or punctuation, and do not insert whitespace after the answer prefix."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -406,39 +449,118 @@ def render_observable_prompt(
 ) -> str:
     """Render exclusively from fields available to an observer of the transcript."""
 
-    lines = [f"A value s is uniformly distributed over the integers 1 through {n}."]
+    lines = [
+        "A secret integer s was sampled uniformly from the displayed domain.",
+        f"DOMAIN: s is one of {_format_set(range(1, n + 1))}.",
+        (
+            "Each question asks whether s is in a displayed set. Its truthful answer is "
+            "YES exactly when s is in that set, otherwise NO."
+        ),
+    ]
     if shared_reliability:
-        r = fraction_text(reliabilities[0])
-        lines.append(
-            f"For every question, the reported answer equals the correct YES/NO answer "
-            f"with probability {r}; otherwise it is flipped. Reports are conditionally "
-            "independent given s."
+        exact_r = fraction_text(reliabilities[0])
+        displayed_r = reliability_surface(reliabilities[0])
+        lines.extend(
+            [
+                (
+                    "The observed SOURCE report equals the truthful answer with probability "
+                    f"r={displayed_r} (exactly {exact_r}) and is flipped with probability "
+                    f"1-r={reliability_surface(1 - reliabilities[0])}."
+                ),
+                (
+                    "Equivalently: if the truthful answer is YES, SOURCE reports YES with "
+                    f"probability {displayed_r} and NO with probability "
+                    f"{reliability_surface(1 - reliabilities[0])}; if the truthful answer is "
+                    f"NO, SOURCE reports NO with probability {displayed_r} and YES with "
+                    f"probability {reliability_surface(1 - reliabilities[0])}."
+                ),
+            ]
         )
     else:
-        lines.append(
-            "Reports are conditionally independent given s. Each question's reliability "
-            "is stated below; an incorrect report is the flipped YES/NO answer."
+        lines.extend(
+            [
+                (
+                    "Each question states its own reliability r_i. For that question, the "
+                    "observed SOURCE report equals the truthful answer with probability r_i "
+                    "and is flipped with probability 1-r_i."
+                ),
+                (
+                    "Equivalently: SOURCE reports the truthful YES/NO value with probability "
+                    "r_i and the opposite YES/NO value with probability 1-r_i."
+                ),
+            ]
         )
-    lines.append("")
+    lines.extend(
+        [
+            "Channel outcomes are independent conditional on s.",
+            (
+                "The questions were chosen externally, so their displayed set contents are "
+                "not evidence about s."
+            ),
+            "",
+            "OBSERVATIONS:",
+        ]
+    )
     for index, (question, report, reliability) in enumerate(
         zip(questions, reports, reliabilities), start=1
     ):
-        suffix = "" if shared_reliability else f" [reliability {fraction_text(reliability)}]"
+        suffix = (
+            ""
+            if shared_reliability
+            else (
+                f" [SOURCE reliability r={reliability_surface(reliability)} "
+                f"(exactly {fraction_text(reliability)})]"
+            )
+        )
         membership = question["membership_set"]
         lines.append(f"Q{index}: Is s in {_format_set(membership)}?{suffix}")  # type: ignore[arg-type]
-        lines.append(f"Observed report: {report}")
+        lines.append(f"SOURCE reported {report}.")
     lines.extend(
         [
             "",
+            "QUESTION:",
             (
-                f"Using the full transcript, is P(s={probe.x} | reports) greater than "
-                f"P(s={probe.y} | reports), or vice versa?"
+                f"Given all observations, which has larger posterior probability: s={probe.x} "
+                f"or s={probe.y}?"
             ),
         ]
     )
     choices = f"{probe.x} or {probe.y}" + (" or SAME" if probe.allow_same else "")
-    lines.append(f"Reply with exactly {choices}.")
-    lines.append("REASONING:" if stage == "reasoning" else "ANSWER:")
+    lines.append(f"The decision value must be exactly one of: {choices}.")
+    if probe.allow_same:
+        lines.append(
+            "If the two posterior probabilities are equal, the required decision value is SAME."
+        )
+    allowed_values = [str(probe.x), str(probe.y)] + (["SAME"] if probe.allow_same else [])
+    allowed_responses = " | ".join(
+        f"{probe.answer_prefix}{value}" for value in allowed_values
+    )
+    if stage == "reasoning":
+        lines.extend(
+            [
+                (
+                    "Reason carefully from the raw observations and the stated channel rules. "
+                    f"Keep the explanation at most {probe.reasoning_budget} words."
+                ),
+                (
+                    f"When asked for the final answer, output exactly one of: "
+                    f"{allowed_responses}. Do not include any other text in the answer, and do "
+                    "not insert whitespace after the answer prefix."
+                ),
+                "REASONING:",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Do not provide reasoning, explanation, calculations, or intermediate work.",
+                (
+                    f"Output exactly one of: {allowed_responses}. Your entire assistant "
+                    "response must be that allowed response with no other words or punctuation. "
+                    "Do not insert whitespace after the answer prefix."
+                ),
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -484,12 +606,18 @@ def stage_two_messages(
         return [
             *(dict(message) for message in first_messages),
             {"role": "assistant", "content": enforced_reasoning},
-            {"role": "user", "content": "ANSWER:"},
+            {
+                "role": "user",
+                "content": "Now provide only the final answer in the required format.",
+            },
         ]
     if layout == "replay_user":
         system = [dict(message) for message in first_messages if message["role"] == "system"]
         user = next(message["content"] for message in first_messages if message["role"] == "user")
-        replay = f"{user}\n{enforced_reasoning}\nANSWER:"
+        replay = (
+            f"{user}\n{enforced_reasoning}\n"
+            "Now provide only the final answer in the required format."
+        )
         return [*system, {"role": "user", "content": replay}]
     raise ValueError(f"Unknown call layout {layout!r}.")
 
@@ -567,6 +695,8 @@ def _posterior_target_fields(
             "y_posterior": None,
             "posterior_difference": None,
             "posterior_log_odds": None,
+            "posterior_log_odds_base": SOFTMAX_LOG_BASE,
+            "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
             "ground_truth_choice": None,
             "normative_comparison": None,
         }
@@ -580,9 +710,7 @@ def _posterior_target_fields(
         comparison = "SAME"
     ground_truth = comparison if comparison != "SAME" or probe.allow_same else None
     if x_probability > 0 and y_probability > 0:
-        import math
-
-        log_odds: float | None = math.log(float(x_probability / y_probability))
+        log_odds: float | None = natural_log_ratio(x_probability, y_probability)
     elif x_probability == y_probability:
         log_odds = 0.0
     else:
@@ -601,6 +729,8 @@ def _posterior_target_fields(
         "y_posterior": float(y_probability),
         "posterior_difference": float(x_probability - y_probability),
         "posterior_log_odds": log_odds,
+        "posterior_log_odds_base": SOFTMAX_LOG_BASE,
+        "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
         "ground_truth_choice": ground_truth,
         "normative_comparison": comparison,
     }
@@ -633,6 +763,8 @@ def build_candidate_evidence_row(
             raise ValueError(f"Source row {key} does not match the reduced probe.")
     if bool(source_row["allow_same"]) != probe.allow_same:
         raise ValueError("Reduced and raw probes must use the same allow_same policy.")
+    if str(source_row.get("answer_prefix", "ANSWER:")) != probe.answer_prefix:
+        raise ValueError("Reduced and raw probes must use the same answer prefix.")
 
     reliabilities = tuple(
         as_fraction(str(value))
@@ -698,6 +830,7 @@ def build_candidate_evidence_row(
             "allow_same": probe.allow_same,
             "reasoning_budget": probe.reasoning_budget,
             "call_layout": probe.call_layout,
+            "answer_prefix": probe.answer_prefix,
         },
         "system_prompt": system_prompt.content,
         "messages": messages,
@@ -724,6 +857,7 @@ def build_candidate_evidence_row(
         "allow_same": probe.allow_same,
         "reasoning_budget": probe.reasoning_budget,
         "call_layout": probe.call_layout,
+        "answer_prefix": probe.answer_prefix,
         "candidate_evidence": candidate_evidence,
         "audit_metadata": {
             "source_row_id": source_row_id,
@@ -788,6 +922,7 @@ def build_row(
         "allow_same": probe.allow_same,
         "reasoning_budget": probe.reasoning_budget,
         "call_layout": probe.call_layout,
+        "answer_prefix": probe.answer_prefix,
         "system_prompt": system_prompt.content,
         "messages": messages,
         "serialized_prompt": serialized_prompt,
@@ -814,6 +949,7 @@ def build_row(
         "allow_same": probe.allow_same,
         "reasoning_budget": probe.reasoning_budget,
         "call_layout": probe.call_layout,
+        "answer_prefix": probe.answer_prefix,
         "messages": messages,
         "serialized_prompt": serialized_prompt,
         "input_ids": input_ids,
@@ -833,6 +969,8 @@ def build_row(
                 "y_posterior": None,
                 "posterior_difference": None,
                 "posterior_log_odds": None,
+                "posterior_log_odds_base": SOFTMAX_LOG_BASE,
+                "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
                 "ground_truth_choice": None,
                 "normative_comparison": None,
             }
@@ -848,9 +986,7 @@ def build_row(
         comparison = "SAME"
     ground_truth = comparison if comparison != "SAME" or probe.allow_same else None
     if x_probability > 0 and y_probability > 0:
-        import math
-
-        log_odds: float | None = math.log(float(x_probability / y_probability))
+        log_odds: float | None = natural_log_ratio(x_probability, y_probability)
     elif x_probability == y_probability:
         log_odds = 0.0
     else:
@@ -873,6 +1009,8 @@ def build_row(
             "y_posterior": float(y_probability),
             "posterior_difference": float(x_probability - y_probability),
             "posterior_log_odds": log_odds,
+            "posterior_log_odds_base": SOFTMAX_LOG_BASE,
+            "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
             "ground_truth_choice": ground_truth,
             "normative_comparison": comparison,
         }

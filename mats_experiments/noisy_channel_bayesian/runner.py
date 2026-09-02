@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
+    SOFTMAX_LOG_BASE,
+    SOFTMAX_LOG_UNIT,
     CaptureSpec,
     MetricSpec,
     TokenizerBinding,
@@ -108,20 +110,37 @@ def parse_model_choice(
     x_surface: str = "X",
     y_surface: str = "Y",
     same_surface: str = "SAME",
+    strict: bool = False,
+    answer_prefix: str = "ANSWER:",
 ) -> str | None:
-    """Parse model-facing surfaces and return the internal X/Y/SAME label."""
+    """Parse model-facing surfaces and return the internal X/Y/SAME label.
+
+    Strict mode accepts only a bare allowed value or that value preceded by the
+    configured answer prefix.  It therefore rejects explanations that merely
+    mention an allowed value.
+    """
 
     surfaces = {"X": x_surface, "Y": y_surface, "SAME": same_surface}
     reverse = {surface.casefold(): choice for choice, surface in surfaces.items()}
     if len(reverse) != len(surfaces):
         raise ValueError("Choice surfaces must be distinct (ignoring case).")
-    alternatives = sorted(surfaces.values(), key=len, reverse=True)
+    enabled = {key: value for key, value in surfaces.items() if key != "SAME" or allow_same}
+    alternatives = sorted(enabled.values(), key=len, reverse=True)
+    if strict:
+        value_pattern = "|".join(re.escape(value) for value in alternatives)
+        prefix = answer_prefix.strip()
+        optional_prefix = f"(?:{re.escape(prefix)}\\s*)?" if prefix else ""
+        match = re.fullmatch(
+            rf"\s*{optional_prefix}({value_pattern})\s*",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return reverse[match.group(1).casefold()] if match else None
     pattern = r"(?<!\w)(" + "|".join(re.escape(value) for value in alternatives) + r")(?!\w)"
     matches = re.findall(pattern, text, flags=re.IGNORECASE)
     if not matches:
         return None
-    choice = reverse[matches[-1].casefold()]
-    return choice if choice != "SAME" or allow_same else None
+    return reverse[matches[-1].casefold()]
 
 
 def _model_layers(model: Any) -> list[Any]:
@@ -332,6 +351,39 @@ class QwenRunner:
             raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
         return rendered
 
+    def _serialize_continued_assistant(
+        self, messages: Sequence[Mapping[str, str]]
+    ) -> str:
+        """Serialize a final assistant prefill without closing that message."""
+
+        if not messages or messages[-1].get("role") != "assistant":
+            raise ValueError("Continued serialization requires a final assistant message.")
+        kwargs: dict[str, object] = {
+            "tokenize": False,
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+            "enable_thinking": False,
+        }
+        try:
+            rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        except TypeError:
+            # Simple or older tokenizers may not expose Qwen's optional template kwargs.
+            kwargs.pop("enable_thinking")
+            try:
+                rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
+            except TypeError:
+                kwargs.pop("continue_final_message")
+                rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        if not isinstance(rendered, str):
+            raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
+        answer_prefix = str(messages[-1]["content"])
+        if not rendered.endswith(answer_prefix):
+            raise ValueError(
+                "The tokenizer closed or altered the assistant answer prefill; candidate logits "
+                "would not be measured immediately after the configured answer prefix."
+            )
+        return rendered
+
     def _encode_prompts(self, prompts: Sequence[str]) -> dict[str, Any]:
         import torch
 
@@ -509,6 +561,8 @@ class QwenRunner:
                 "answer_surfaces": spec.surfaces,
                 "answer_surface_token_ids": surface_ids,
                 "sequence_log_probabilities": {},
+                "sequence_log_probability_base": SOFTMAX_LOG_BASE,
+                "sequence_log_probability_unit": SOFTMAX_LOG_UNIT,
             }
             for spec, surface_ids in zip(metric_specs, surface_ids_by_row)
         ]
@@ -538,6 +592,7 @@ class QwenRunner:
         attention_mask = torch.tensor(masks, dtype=torch.long, device=self.device)
         with torch.inference_mode():
             output = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            # PyTorch log_softmax is ln(softmax(logits)); scores are therefore in nats.
             log_probs = output.logits.float().log_softmax(-1)
         for job_index, ((row_index, choice, _, answer), offset) in enumerate(zip(jobs, offsets)):
             positions = torch.arange(offset, offset + len(answer), device=self.device)
@@ -579,6 +634,8 @@ class QwenRunner:
                         for choice, surface in spec.surfaces.items()
                     },
                     "sequence_log_probabilities": None,
+                    "sequence_log_probability_base": SOFTMAX_LOG_BASE,
+                    "sequence_log_probability_unit": SOFTMAX_LOG_UNIT,
                     "x_sequence_log_probability": None,
                     "y_sequence_log_probability": None,
                     "same_sequence_log_probability": None,
@@ -828,15 +885,21 @@ class QwenRunner:
                     str(reasoning_results[row_id]["text"]), int(row["reasoning_budget"])
                 )
                 enforced_by_id[row_id] = enforced
-                messages = stage_two_messages(
+                base_messages = stage_two_messages(
                     first_messages=row["messages"],  # type: ignore[arg-type]
                     enforced_reasoning=enforced,
                     layout=str(row["call_layout"]),  # type: ignore[arg-type]
                 )
-                prompt = self._serialize(messages)
             else:
-                messages = [dict(message) for message in row["messages"]]  # type: ignore[union-attr]
-                prompt = self._serialize(messages)
+                base_messages = [  # type: ignore[union-attr]
+                    dict(message) for message in row["messages"]
+                ]
+            answer_prefix = str(row.get("answer_prefix", "ANSWER:"))
+            messages = [
+                *base_messages,
+                {"role": "assistant", "content": answer_prefix},
+            ]
+            prompt = self._serialize_continued_assistant(messages)
             answer_messages[row_id] = messages
             answer_items.append((row_id, prompt))
         answer_prompt_records = {
@@ -883,12 +946,17 @@ class QwenRunner:
                 answer = answer_results[row_id]
                 score_record = scores_by_id[row_id]
                 answer_surfaces = score_record["answer_surfaces"]
+                assistant_completion = str(source.get("answer_prefix", "ANSWER:")) + str(
+                    answer["text"]
+                )
                 choice = parse_model_choice(
-                    str(answer["text"]),
+                    assistant_completion,
                     allow_same=bool(source["allow_same"]),
                     x_surface=str(answer_surfaces["X"]),  # type: ignore[index]
                     y_surface=str(answer_surfaces["Y"]),  # type: ignore[index]
                     same_surface=str(answer_surfaces["SAME"]),  # type: ignore[index]
+                    strict=True,
+                    answer_prefix=str(source.get("answer_prefix", "ANSWER:")),
                 )
                 ground_truth = source.get("ground_truth_choice")
                 posterior_correct = choice == ground_truth if ground_truth is not None else None
@@ -915,11 +983,16 @@ class QwenRunner:
                     "enforced_reasoning": enforced_by_id.get(row_id),
                     "reasoning_completion": reasoning,
                     "answer_completion": answer,
+                    "assistant_completion": assistant_completion,
                     "model_choice": choice,
                     "model_choice_surface": (
                         answer_surfaces[choice] if choice is not None else None  # type: ignore[index]
                     ),
                     "parse_compliance": choice is not None,
+                    "strict_answer_compliance": choice is not None,
+                    "zero_reasoning_compliance": (
+                        choice is not None if int(source["reasoning_budget"]) == 0 else None
+                    ),
                     "posterior_correct": posterior_correct,
                     **score_record,
                     **capture_paths.get(row_id, {}),

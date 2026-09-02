@@ -1,4 +1,5 @@
 import json
+import math
 import random
 from fractions import Fraction
 from pathlib import Path
@@ -6,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from mats_experiments.noisy_channel_bayesian import (
+    SOFTMAX_LOG_BASE,
+    SOFTMAX_LOG_UNIT,
     CandidateEvidenceBayesianEnvironment,
     CandidateEvidenceDatasetGenerator,
     CandidateEvidenceQuestion,
@@ -21,6 +24,7 @@ from mats_experiments.noisy_channel_bayesian import (
     enforce_reasoning,
     exact_bayesian_target,
     exact_pattern_mass,
+    natural_log_ratio,
     resolve_selector,
     stage_two_messages,
     strip_thinking_markers,
@@ -125,6 +129,9 @@ def test_valid_transcripts_persist_x_and_y_posteriors_exactly(tmp_path: Path) ->
     assert observed_yes["y_posterior_exact"] == "1/4"
     assert observed_yes["x_posterior"] == pytest.approx(0.75)
     assert observed_yes["y_posterior"] == pytest.approx(0.25)
+    assert observed_yes["posterior_log_odds"] == pytest.approx(math.log(3))
+    assert observed_yes["posterior_log_odds_base"] == SOFTMAX_LOG_BASE == "e"
+    assert observed_yes["posterior_log_odds_unit"] == SOFTMAX_LOG_UNIT == "nats"
 
     dataset.save(tmp_path)
     persisted = TranscriptDataset.load(tmp_path)[0]
@@ -132,6 +139,14 @@ def test_valid_transcripts_persist_x_and_y_posteriors_exactly(tmp_path: Path) ->
     assert persisted["y_posterior_exact"] == "1/4"
     assert persisted["x_posterior"] == pytest.approx(0.75)
     assert persisted["y_posterior"] == pytest.approx(0.25)
+
+
+def test_natural_log_ratio_matches_softmax_logit_scale() -> None:
+    assert natural_log_ratio(Fraction(8), Fraction(1)) == pytest.approx(math.log(8))
+    assert natural_log_ratio(Fraction(8), Fraction(1)) / math.log(2) == pytest.approx(3)
+    assert natural_log_ratio(Fraction(1), Fraction(8)) == pytest.approx(-math.log(8))
+    with pytest.raises(ValueError, match="positive"):
+        natural_log_ratio(Fraction(0), Fraction(1))
 
 
 def test_rows_and_prompts_do_not_contain_prohibited_latent_metadata() -> None:
@@ -174,7 +189,9 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
         first_messages=base, enforced_reasoning="work", layout="replay_user"
     )
     assert len(replay) == 1
-    assert replay[0]["content"].endswith("work\nANSWER:")
+    assert replay[0]["content"].endswith(
+        "work\nNow provide only the final answer in the required format."
+    )
 
     tied = generator(
         environment=NoisyChannelBayesianEnvironment(n=2, k=1, r_values=Fraction(1, 2)),
@@ -183,6 +200,18 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
     ).generate(num_question_sets=1)
     assert all(row["normative_comparison"] == "SAME" for row in tied)
     assert all(row["ground_truth_choice"] is None for row in tied)
+
+    same_allowed = generator(
+        environment=NoisyChannelBayesianEnvironment(n=2, k=1, r_values=Fraction(1, 2)),
+        question=FixedSubsetQuestion([[1]]),
+        probe=XVsYPosteriorProbe(x=1, y=2, allow_same=True),
+    ).generate(num_question_sets=1)
+    assert all(row["ground_truth_choice"] == "SAME" for row in same_allowed)
+    assert all(
+        "If the two posterior probabilities are equal, the required decision value is SAME."
+        in row["messages"][-1]["content"]
+        for row in same_allowed
+    )
 
 
 @pytest.mark.parametrize("reasoning_budget", [0, 12])
@@ -193,9 +222,21 @@ def test_probe_values_are_the_model_facing_answer_surfaces(reasoning_budget: int
         probe=XVsYPosteriorProbe(x=2, y=7, reasoning_budget=reasoning_budget),
     ).generate(num_question_sets=1)
     prompt = dataset[0]["messages"][-1]["content"]
-    assert "Reply with exactly 2 or 7." in prompt
+    assert "A secret integer s was sampled uniformly from the displayed domain." in prompt
+    assert "if the truthful answer is NO, SOURCE reports NO" in prompt
+    assert "displayed set contents are not evidence about s" in prompt
+    assert "The decision value must be exactly one of: 2 or 7." in prompt
     assert "where X means" not in prompt
-    assert prompt.endswith("REASONING:" if reasoning_budget else "ANSWER:")
+    if reasoning_budget:
+        assert "Reason carefully from the raw observations" in prompt
+        assert "Do not provide reasoning" not in prompt
+        assert prompt.endswith("REASONING:")
+    else:
+        assert "Do not provide reasoning, explanation, calculations" in prompt
+        assert "Output exactly one of: ANSWER:2 | ANSWER:7." in prompt
+        assert "Your entire assistant response must be that allowed response" in prompt
+        assert not prompt.endswith("ANSWER:")
+    assert dataset[0]["answer_prefix"] == "ANSWER:"
 
     resolved = MetricSpec().resolve(x=2, y=7)
     assert resolved.surfaces == {"X": "2", "Y": "7", "SAME": "SAME"}
@@ -246,7 +287,7 @@ def test_candidate_evidence_projection_is_exact_paired_and_set_free(
     prompt = row["messages"][-1]["content"]
     assert "Candidate s=2:" in prompt
     assert "Candidate s=7:" in prompt
-    assert "Reply with exactly 2 or 7." in prompt
+    assert "The decision value must be exactly one of: 2 or 7." in prompt
     assert "Candidate X" not in prompt
     assert "Observation 1: AGREES; reliability 0.95." in prompt
     assert "Is s in" not in prompt

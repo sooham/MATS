@@ -8,6 +8,8 @@ from .captures import (
     load_logit_tensors,
 )
 from .core import (
+    SOFTMAX_LOG_BASE,
+    SOFTMAX_LOG_UNIT,
     CandidateEvidenceBayesianEnvironment,
     CandidateEvidenceQuestion,
     CaptureSpec,
@@ -22,6 +24,7 @@ from .core import (
     derive_candidate_evidence,
     enforce_reasoning,
     exact_bayesian_target,
+    natural_log_ratio,
     render_candidate_evidence_prompt,
     render_observable_prompt,
     stage_two_messages,
@@ -44,6 +47,8 @@ from .runner import (
 )
 
 __all__ = [
+    "SOFTMAX_LOG_BASE",
+    "SOFTMAX_LOG_UNIT",
     "CandidateEvidenceBayesianEnvironment",
     "CandidateEvidenceDatasetGenerator",
     "CandidateEvidenceQuestion",
@@ -70,6 +75,7 @@ __all__ = [
     "get_logits",
     "load_activation_tensors",
     "load_logit_tensors",
+    "natural_log_ratio",
     "parse_model_choice",
     "render_candidate_evidence_prompt",
     "render_observable_prompt",

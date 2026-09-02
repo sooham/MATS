@@ -145,10 +145,18 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
     assert model.generate_calls == 2
     assert all(row["model_choice"] == "X" for row in results)
     assert all(row["model_choice_surface"] == "1" for row in results)
+    assert all(row["assistant_completion"] == "ANSWER:1" for row in results)
+    assert all(row["strict_answer_compliance"] is True for row in results)
+    assert all(row["answer_messages"][-1] == {
+        "role": "assistant", "content": "ANSWER:"
+    } for row in results)
+    assert all(row["answer_serialized_prompt"].endswith("<assistant>ANSWER:") for row in results)
     assert all(row["answer_surfaces"]["X"] == "1" for row in results)
     assert all(row["answer_surfaces"]["Y"] == "2" for row in results)
     assert all(row["answer_surface_token_ids"]["X"] == [ord("1") + 3] for row in results)
     assert all(set(row["sequence_log_probabilities"]) == {"1", "2", "SAME"} for row in results)
+    assert all(row["sequence_log_probability_base"] == "e" for row in results)
+    assert all(row["sequence_log_probability_unit"] == "nats" for row in results)
     assert all(
         row["sequence_log_probabilities"]["1"]
         == row["x_sequence_log_probability"]
@@ -296,7 +304,9 @@ def test_runner_reserializes_with_runtime_tokenizer_and_persists_exact_tokens(
     assert result["answer_input_ids"] == runtime_tokenizer.encode(
         result["answer_serialized_prompt"]
     )
-    assert "Reply with exactly 1 or 2." in result["answer_serialized_prompt"]
+    assert "The decision value must be exactly one of: 1 or 2." in result[
+        "answer_serialized_prompt"
+    ]
     assert result["runtime_tokenizer_template_fingerprint"] != result[
         "tokenizer_template_fingerprint"
     ]
@@ -306,6 +316,101 @@ def test_numeric_choice_parser_uses_whole_surfaces() -> None:
     assert parse_model_choice("Final answer: 2", allow_same=False, x_surface="2", y_surface="7") == "X"
     assert parse_model_choice("Final answer: 7", allow_same=False, x_surface="2", y_surface="7") == "Y"
     assert parse_model_choice("Final answer: 27", allow_same=False, x_surface="2", y_surface="7") is None
+    assert parse_model_choice(
+        "2", allow_same=False, x_surface="2", y_surface="7", strict=True
+    ) == "X"
+    assert parse_model_choice(
+        "ANSWER: 7", allow_same=False, x_surface="2", y_surface="7", strict=True
+    ) == "Y"
+    assert parse_model_choice(
+        "ANSWER: 2 because it agrees",
+        allow_same=False,
+        x_surface="2",
+        y_surface="7",
+        strict=True,
+    ) is None
+    assert parse_model_choice(
+        "SAME", allow_same=False, x_surface="2", y_surface="7", strict=True
+    ) is None
+    assert parse_model_choice(
+        "ANSWER: SAME",
+        allow_same=True,
+        x_surface="2",
+        y_surface="7",
+        strict=True,
+    ) == "SAME"
+
+
+class VerboseAnswerFakeModel(FakeModel):
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens, kwargs
+        self.generate_calls += 1
+        suffix = torch.tensor(
+            [[ord(character) + 3 for character in "1 because"] + [2]] * len(input_ids)
+        )
+        return torch.cat([input_ids, suffix], dim=1)
+
+
+def test_zero_budget_rejects_an_explanatory_answer(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    results = QwenRunner(
+        model=VerboseAnswerFakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="verbose_zero", batch_size=2),
+    )
+    assert all(row["assistant_completion"] == "ANSWER:1 because" for row in results)
+    assert all(row["model_choice"] is None for row in results)
+    assert all(row["strict_answer_compliance"] is False for row in results)
+    assert all(row["zero_reasoning_compliance"] is False for row in results)
+
+
+class ReasonThenSameFakeModel(FakeModel):
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens, kwargs
+        self.generate_calls += 1
+        text = "brief work" if self.generate_calls == 1 else "SAME"
+        suffix = torch.tensor(
+            [[ord(character) + 3 for character in text] + [2]] * len(input_ids)
+        )
+        return torch.cat([input_ids, suffix], dim=1)
+
+
+@pytest.mark.parametrize("call_layout", ["conversation", "replay_user"])
+def test_allow_same_with_reasoning_works_for_both_layouts(
+    tmp_path: Path, call_layout: str
+) -> None:
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(n=2, k=1, r_values="1/2"),
+        FixedSubsetQuestion([[1]]),
+        XVsYPosteriorProbe(
+            x=1,
+            y=2,
+            reasoning_budget=3,
+            allow_same=True,
+            call_layout=call_layout,
+        ),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    model = ReasonThenSameFakeModel()
+    results = QwenRunner(
+        model=model, tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id=f"same_{call_layout}",
+            batch_size=2,
+        ),
+    )
+    assert all(row["normative_comparison"] == "SAME" for row in results)
+    assert all(row["ground_truth_choice"] == "SAME" for row in results)
+    assert all(row["model_choice"] == "SAME" for row in results)
+    assert all(row["assistant_completion"] == "ANSWER:SAME" for row in results)
+    assert all(row["strict_answer_compliance"] is True for row in results)
+    assert all(row["posterior_correct"] is True for row in results)
+    assert all(row["call_layout"] == call_layout for row in results)
 
 
 class ThinkingMarkerFakeModel(FakeModel):
