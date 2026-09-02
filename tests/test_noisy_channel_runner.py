@@ -1,0 +1,228 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from safetensors.torch import load_file
+from torch import nn
+
+from mats_experiments.noisy_channel_bayesian import (
+    CaptureSpec,
+    ExecutionConfig,
+    FixedSubsetQuestion,
+    NoisyChannelBayesianEnvironment,
+    QwenRunner,
+    TokenizerBinding,
+    TranscriptDatasetGenerator,
+    XVsYPosteriorProbe,
+    select_unpadded_tokens,
+)
+
+
+class FakeTokenizer:
+    chat_template = "fake"
+    name_or_path = "fake"
+    padding_side = "left"
+    pad_token_id = 0
+    eos_token_id = 2
+
+    def encode(self, text):
+        return [ord(character) + 3 for character in text]
+
+    def apply_chat_template(
+        self, messages, *, tokenize, add_generation_prompt, enable_thinking=False
+    ):
+        del enable_thinking
+        text = "".join(f"<{item['role']}>{item['content']}" for item in messages)
+        if add_generation_prompt:
+            text += "<assistant>"
+        return self.encode(text) if tokenize else text
+
+    def __call__(self, text, *, padding=False, add_special_tokens=False, return_tensors=None):
+        del add_special_tokens
+        if isinstance(text, str):
+            return {"input_ids": self.encode(text)}
+        rows = [self.encode(value) for value in text]
+        width = max(map(len, rows))
+        padded = [[0] * (width - len(row)) + row for row in rows]
+        masks = [[0] * (width - len(row)) + [1] * len(row) for row in rows]
+        if return_tensors == "pt":
+            return {
+                "input_ids": torch.tensor(padded),
+                "attention_mask": torch.tensor(masks),
+            }
+        assert padding
+        return {"input_ids": padded, "attention_mask": masks}
+
+    def decode(self, ids, *, skip_special_tokens=True):
+        del skip_special_tokens
+        return "".join(chr(token - 3) for token in ids if token > 2)
+
+
+class FakeLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.self_attn = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.mlp = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, hidden):
+        return hidden + self.mlp(self.self_attn(hidden))
+
+
+class FakeModel(nn.Module):
+    def __init__(self, *, oom_batches=False):
+        super().__init__()
+        self.embedding = nn.Embedding(300, 4)
+        self.layers = nn.ModuleList([FakeLayer(4), FakeLayer(4)])
+        self.model = SimpleNamespace(language_model=SimpleNamespace(layers=self.layers))
+        self.generation_config = SimpleNamespace(eos_token_id=2)
+        self.generate_calls = 0
+        self.oom_batches = oom_batches
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def forward(self, input_ids, attention_mask, use_cache=False):
+        del attention_mask, use_cache
+        hidden = self.embedding(input_ids)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        logits = torch.zeros(*input_ids.shape, 300)
+        logits[..., ord("X") + 3] = 3
+        logits[..., ord("Y") + 3] = 1
+        return SimpleNamespace(logits=logits)
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens, kwargs
+        self.generate_calls += 1
+        if self.oom_batches and len(input_ids) > 1:
+            raise RuntimeError("CUDA out of memory")
+        suffix = torch.tensor([[ord("X") + 3, 2]] * len(input_ids))
+        return torch.cat([input_ids, suffix], dim=1)
+
+
+def make_dataset(tmp_path: Path, *, reasoning_budget=3):
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(n=2, k=1, r_values="3/4"),
+        FixedSubsetQuestion([[1]]),
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=reasoning_budget),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    dataset.save(tmp_path)
+    return dataset, tokenizer
+
+
+def test_padding_is_removed_before_token_selection() -> None:
+    tensor = torch.arange(2 * 4 * 2).reshape(2, 4, 2)
+    mask = torch.tensor([[0, 0, 1, 1], [0, 1, 1, 1]])
+    selected = select_unpadded_tokens(tensor, mask, "all")
+    assert selected[0].shape == (2, 2)
+    assert torch.equal(selected[0], tensor[0, 2:])
+    assert selected[1].shape == (3, 2)
+
+
+def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path)
+    model = FakeModel()
+    runner = QwenRunner(model=model, tokenizer=tokenizer, device=torch.device("cpu"))
+    config = ExecutionConfig(
+        experiment_dir=tmp_path,
+        run_id="fake",
+        batch_size=2,
+        capture=CaptureSpec(
+            logits_boundaries=("reasoning", "answer"),
+            streams=("resid_pre", "token_mixer_out", "mlp_out", "resid_post"),
+            layers="all",
+            tokens="last",
+        ),
+    )
+    results = runner.execute(dataset, config)
+    assert len(results) == 2
+    assert model.generate_calls == 2
+    assert all(row["model_choice"] == "X" for row in results)
+    assert all(row["x_minus_y_logit"] == pytest.approx(2) for row in results)
+    assert all(len(row["enforced_reasoning"].split()) <= 3 for row in results)
+    tensors = load_file(tmp_path / "runs/fake/activations" / f"{results[0]['row_id']}.safetensors")
+    assert "reasoning.resid_pre.layer_0" in tensors
+    assert "answer.resid_post.layer_1" in tensors
+    logits = load_file(tmp_path / "runs/fake/logits" / f"{results[0]['row_id']}.safetensors")
+    assert logits["answer.logits"].shape == (300,)
+
+    resumed = runner.execute(dataset, config)
+    assert len(resumed) == 2
+    assert model.generate_calls == 2
+
+
+def test_oom_recursively_splits_batches(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    model = FakeModel(oom_batches=True)
+    runner = QwenRunner(model=model, tokenizer=tokenizer, device=torch.device("cpu"))
+    results = runner.execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="oom", batch_size=2),
+    )
+    assert len(results) == 2
+    assert results.manifest["oom_retries"] == 1
+    assert sorted(results.manifest["effective_batch_sizes"]) == [1, 1]
+
+
+def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    runner = QwenRunner(model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu"))
+    results = runner.execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="decode",
+            batch_size=2,
+            capture=CaptureSpec(
+                logits_boundaries=("answer",),
+                streams=("resid_post",),
+                layers=(-1,),
+                every_decode_position=True,
+            ),
+        ),
+    )
+    tensors = load_file(tmp_path / "runs/decode/logits" / f"{results[0]['row_id']}.safetensors")
+    assert tensors["answer.logits"].shape == (1, 300)
+    activations = load_file(
+        tmp_path / "runs/decode/activations" / f"{results[0]['row_id']}.safetensors"
+    )
+    assert activations["answer.resid_post.layer_1"].shape == (1, 4)
+
+
+def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    runner = QwenRunner(model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu"))
+    results = runner.execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="all_prompt_tokens",
+            batch_size=2,
+            capture=CaptureSpec(
+                logits_boundaries=("answer",),
+                streams=("resid_pre", "token_mixer_out", "mlp_out", "resid_post"),
+                layers="all",
+                tokens="all",
+                every_decode_position=False,
+            ),
+        ),
+    )
+    for row in results:
+        activations = load_file(
+            tmp_path / "runs/all_prompt_tokens/activations" / f"{row['row_id']}.safetensors"
+        )
+        assert activations["answer.resid_pre.layer_0"].shape == (
+            len(row["input_ids"]),
+            4,
+        )
+        assert activations["answer.token_mixer_out.layer_1"].shape == (
+            len(row["input_ids"]),
+            4,
+        )
+        logits = load_file(
+            tmp_path / "runs/all_prompt_tokens/logits" / f"{row['row_id']}.safetensors"
+        )
+        assert logits["answer.logits"].shape == (300,)

@@ -9,6 +9,7 @@ dependencies = [
     "gptqmodel>=5.8",
     "huggingface-hub>=0.30",
     "matplotlib>=3.8",
+    "safetensors>=0.5",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "transformers>=4.51",
