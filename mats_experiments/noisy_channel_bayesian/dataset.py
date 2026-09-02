@@ -7,7 +7,7 @@ import os
 import random
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, overload
@@ -138,6 +138,12 @@ class TranscriptDataset:
     def summarize(self) -> dict[str, object]:
         """Compute uniform-history and natural-distribution accuracy aggregates."""
 
+        def natural_weight(row: dict[str, object]) -> float:
+            presentations = int(row.get("presentations_per_scenario", 1))
+            if presentations < 1:
+                raise ValueError("presentations_per_scenario must be positive.")
+            return float(row["prior_predictive"]) / presentations
+
         defined = [row for row in self if row.get("posterior_state") == "defined"]
         eligible = [row for row in defined if row.get("ground_truth_choice") is not None]
         scored = [row for row in eligible if row.get("posterior_correct") is not None]
@@ -148,10 +154,10 @@ class TranscriptDataset:
         per_set: list[float] = []
         for index in set_indices:
             set_rows = [row for row in scored if row["question_set_index"] == index]
-            denominator = sum(float(row["prior_predictive"]) for row in set_rows)
+            denominator = sum(natural_weight(row) for row in set_rows)
             if denominator:
                 numerator = sum(
-                    float(row["prior_predictive"]) * bool(row["posterior_correct"])
+                    natural_weight(row) * bool(row["posterior_correct"])
                     for row in set_rows
                 )
                 per_set.append(numerator / denominator)
@@ -168,7 +174,7 @@ class TranscriptDataset:
                 return 0.0
             return sum(
                 sum(
-                    float(row["prior_predictive"])
+                    natural_weight(row)
                     for row in rows
                     if row["question_set_index"] == index
                 )
@@ -184,11 +190,11 @@ class TranscriptDataset:
         compliance_per_set: list[float] = []
         for index in set_indices:
             set_rows = [row for row in compliance_rows if row["question_set_index"] == index]
-            denominator = sum(float(row["prior_predictive"]) for row in set_rows)
+            denominator = sum(natural_weight(row) for row in set_rows)
             if denominator:
                 compliance_per_set.append(
                     sum(
-                        float(row["prior_predictive"]) * bool(row["parse_compliance"])
+                        natural_weight(row) * bool(row["parse_compliance"])
                         for row in set_rows
                     )
                     / denominator
@@ -215,11 +221,81 @@ class TranscriptDataset:
         }
 
 
+RawQuestion = RandomSubsetQuestion | FixedSubsetQuestion
+
+
+def _parameter_axis(
+    value: object,
+    *,
+    expected_type: type | tuple[type, ...],
+    name: str,
+) -> tuple[Any, ...]:
+    """Normalize a fixed component or a non-empty sequence of component values."""
+
+    if isinstance(value, expected_type):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = tuple(value)
+        if not values:
+            raise ValueError(f"The {name} parameter axis must not be empty.")
+        if not all(isinstance(item, expected_type) for item in values):
+            raise TypeError(f"Every {name} parameter value must have the expected type.")
+        return values
+    raise TypeError(f"{name} must be one value or a sequence of values.")
+
+
+def _environment_manifest(environment: NoisyChannelBayesianEnvironment) -> dict[str, object]:
+    return {
+        "type": type(environment).__name__,
+        "n": environment.n,
+        "k": environment.k,
+        "reliabilities_exact": [str(value) for value in environment.reliabilities],
+        "control_positional_bias": environment.control_positional_bias,
+    }
+
+
+def _question_manifest(question: RawQuestion) -> dict[str, object]:
+    if isinstance(question, RandomSubsetQuestion):
+        return {
+            "type": type(question).__name__,
+            "subset_size": question.subset_size,
+            "replacement": question.replacement,
+            "sort": question.sort,
+        }
+    return {
+        "type": type(question).__name__,
+        "subsets": [list(subset) for subset in question.subsets],
+    }
+
+
+def _probe_manifest(probe: XVsYPosteriorProbe) -> dict[str, object]:
+    return {
+        "x": probe.x,
+        "y": probe.y,
+        "allow_same": probe.allow_same,
+        "reasoning_budget": probe.reasoning_budget,
+        "call_layout": probe.call_layout,
+        "answer_prefix": probe.answer_prefix,
+    }
+
+
+def _common_or_none(values: Sequence[Any]) -> Any | None:
+    return values[0] if values and all(value == values[0] for value in values[1:]) else None
+
+
 @dataclass(frozen=True)
 class TranscriptDatasetGenerator:
-    environment: NoisyChannelBayesianEnvironment
-    question: RandomSubsetQuestion | FixedSubsetQuestion
-    probe: XVsYPosteriorProbe
+    """Generate the Cartesian product of environment, question, and probe axes.
+
+    Each component may remain a single fixed instance (the backward-compatible
+    path) or be a sequence. Random question schedules are sampled once per
+    environment/question pair and reused for every probe value, making probe
+    sweeps exactly paired.
+    """
+
+    environment: NoisyChannelBayesianEnvironment | Sequence[NoisyChannelBayesianEnvironment]
+    question: RawQuestion | Sequence[RawQuestion]
+    probe: XVsYPosteriorProbe | Sequence[XVsYPosteriorProbe]
     tokenizer_binding: TokenizerBinding
     system_prompt: SystemPrompt = field(default_factory=SystemPrompt)
     seed: int = 0
@@ -227,49 +303,149 @@ class TranscriptDatasetGenerator:
     def generate(self, *, num_question_sets: int) -> TranscriptDataset:
         if num_question_sets < 1:
             raise ValueError("num_question_sets must be positive.")
-        if isinstance(self.question, FixedSubsetQuestion) and num_question_sets != 1:
-            raise ValueError("FixedSubsetQuestion requires num_question_sets=1.")
-        self.probe.validate(self.environment.n)
-        rng = random.Random(self.seed)
+        environments = _parameter_axis(
+            self.environment,
+            expected_type=NoisyChannelBayesianEnvironment,
+            name="environment",
+        )
+        questions = _parameter_axis(
+            self.question,
+            expected_type=(RandomSubsetQuestion, FixedSubsetQuestion),
+            name="question",
+        )
+        probes = _parameter_axis(
+            self.probe,
+            expected_type=XVsYPosteriorProbe,
+            name="probe",
+        )
+
         rows: list[dict[str, object]] = []
-        schedule_fingerprints: list[list[list[int]]] = []
-        for question_set_index in range(num_question_sets):
-            questions = self.question.sample(rng=rng, n=self.environment.n, k=self.environment.k)
-            schedule_fingerprints.append(
-                [list(question["membership_set"]) for question in questions]  # type: ignore[arg-type]
-            )
-            for pattern_index, reports in enumerate(answer_patterns(self.environment.k)):
-                rows.append(
-                    build_row(
-                        environment=self.environment,
-                        questions=questions,
-                        question_set_index=question_set_index,
-                        reports=reports,
-                        answer_pattern_index=pattern_index,
-                        probe=self.probe,
-                        system_prompt=self.system_prompt,
-                        tokenizer_binding=self.tokenizer_binding,
-                    )
+        parameterizations: list[dict[str, object]] = []
+        schedule_banks: list[dict[str, object]] = []
+        parameterization_index = 0
+        for environment_index, environment in enumerate(environments):
+            for question_index, question in enumerate(questions):
+                if isinstance(question, FixedSubsetQuestion) and num_question_sets != 1:
+                    raise ValueError("FixedSubsetQuestion requires num_question_sets=1.")
+                # Resetting from the same seed makes compatible question variants paired too.
+                rng = random.Random(self.seed)
+                sampled_question_sets = [
+                    question.sample(rng=rng, n=environment.n, k=environment.k)
+                    for _ in range(num_question_sets)
+                ]
+                schedule_banks.append(
+                    {
+                        "environment_parameter_index": environment_index,
+                        "question_parameter_index": question_index,
+                        "question_schedules": [
+                            [
+                                list(sampled_question["membership_set"])  # type: ignore[arg-type]
+                                for sampled_question in sampled_questions
+                            ]
+                            for sampled_questions in sampled_question_sets
+                        ],
+                    }
                 )
+                for probe_index, probe in enumerate(probes):
+                    probe.validate(environment.n)
+                    presented_probes = [(0, probe)]
+                    if environment.control_positional_bias:
+                        presented_probes.append(
+                            (1, replace(probe, x=probe.y, y=probe.x))
+                        )
+                    parameterizations.append(
+                        {
+                            "parameterization_index": parameterization_index,
+                            "environment_parameter_index": environment_index,
+                            "question_parameter_index": question_index,
+                            "probe_parameter_index": probe_index,
+                            "environment": _environment_manifest(environment),
+                            "question": _question_manifest(question),
+                            "probe": _probe_manifest(probe),
+                            "row_count": (
+                                num_question_sets
+                                * 2**environment.k
+                                * len(presented_probes)
+                            ),
+                        }
+                    )
+                    for question_set_index, sampled_questions in enumerate(
+                        sampled_question_sets
+                    ):
+                        for pattern_index, reports in enumerate(
+                            answer_patterns(environment.k)
+                        ):
+                            for presentation_index, presented_probe in presented_probes:
+                                rows.append(
+                                    build_row(
+                                        environment=environment,
+                                        questions=sampled_questions,
+                                        question_set_index=question_set_index,
+                                        reports=reports,
+                                        answer_pattern_index=pattern_index,
+                                        probe=presented_probe,
+                                        canonical_probe=probe,
+                                        presentation_index=presentation_index,
+                                        parameterization_index=parameterization_index,
+                                        environment_parameter_index=environment_index,
+                                        question_parameter_index=question_index,
+                                        probe_parameter_index=probe_index,
+                                        system_prompt=self.system_prompt,
+                                        tokenizer_binding=self.tokenizer_binding,
+                                    )
+                                )
+                    parameterization_index += 1
+
+        environment_manifests = [_environment_manifest(value) for value in environments]
+        question_manifests = [_question_manifest(value) for value in questions]
+        probe_manifests = [_probe_manifest(value) for value in probes]
+        pattern_counts = [2**environment.k for environment in environments]
+        presentation_counts = [
+            2 if environment.control_positional_bias else 1
+            for environment in environments
+        ]
+        rows_per_question_set = sum(
+            2**environment.k
+            * (2 if environment.control_positional_bias else 1)
+            * len(probes)
+            * len(questions)
+            for environment in environments
+        )
+        single_schedule_bank = (
+            schedule_banks[0]["question_schedules"] if len(schedule_banks) == 1 else None
+        )
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "generator_seed": self.seed,
             "num_question_sets": num_question_sets,
-            "patterns_per_question_set": 2**self.environment.k,
-            "n": self.environment.n,
-            "k": self.environment.k,
-            "reliabilities_exact": [str(value) for value in self.environment.reliabilities],
-            "question_type": type(self.question).__name__,
-            "probe": {
-                "x": self.probe.x,
-                "y": self.probe.y,
-                "allow_same": self.probe.allow_same,
-                "reasoning_budget": self.probe.reasoning_budget,
-                "call_layout": self.probe.call_layout,
-            },
+            "parameterization_count": len(parameterizations),
+            "environment_parameter_count": len(environments),
+            "question_parameter_count": len(questions),
+            "probe_parameter_count": len(probes),
+            "patterns_per_question_set": _common_or_none(pattern_counts),
+            "presentations_per_scenario": _common_or_none(presentation_counts),
+            "rows_per_question_set": rows_per_question_set,
+            "control_positional_bias": _common_or_none(
+                [value.control_positional_bias for value in environments]
+            ),
+            "n": _common_or_none([value.n for value in environments]),
+            "k": _common_or_none([value.k for value in environments]),
+            "reliabilities_exact": _common_or_none(
+                [list(item["reliabilities_exact"]) for item in environment_manifests]
+            ),
+            "question_type": _common_or_none(
+                [str(item["type"]) for item in question_manifests]
+            ),
+            "probe": probe_manifests[0] if len(probe_manifests) == 1 else None,
+            "environments": environment_manifests,
+            "questions": question_manifests,
+            "probes": probe_manifests,
+            "reasoning_budgets": [probe.reasoning_budget for probe in probes],
+            "parameterizations": parameterizations,
             "system_prompt": self.system_prompt.content,
             "tokenizer_template_fingerprint": self.tokenizer_binding.fingerprint,
-            "question_schedules": schedule_fingerprints,
+            "question_schedules": single_schedule_bank,
+            "question_schedule_banks": schedule_banks,
         }
         return TranscriptDataset(rows, manifest=manifest)
 
@@ -295,17 +471,30 @@ class CandidateEvidenceDatasetGenerator:
         source_tokenizer = source_dataset.manifest.get("tokenizer_template_fingerprint")
         if source_tokenizer != self.tokenizer_binding.fingerprint:
             raise ValueError("Reduced and raw datasets must use the same tokenizer binding.")
-        rows = [
-            build_candidate_evidence_row(
-                source_row=source_row,
-                environment=self.environment,
-                question=self.question,
-                probe=self.probe,
-                system_prompt=self.system_prompt,
-                tokenizer_binding=self.tokenizer_binding,
+        source_control = bool(source_dataset.manifest.get("control_positional_bias", False))
+        if source_control != self.environment.control_positional_bias:
+            raise ValueError(
+                "Reduced and raw environments must use the same positional-bias control."
             )
-            for source_row in source_dataset
-        ]
+        rows = []
+        for source_row in source_dataset:
+            candidate_1 = int(source_row.get("candidate_1", source_row["x"]))
+            candidate_2 = int(source_row.get("candidate_2", source_row["y"]))
+            if (candidate_1, candidate_2) != (self.probe.x, self.probe.y):
+                raise ValueError("Source canonical candidates do not match the reduced probe.")
+            presented_probe = replace(
+                self.probe, x=int(source_row["x"]), y=int(source_row["y"])
+            )
+            rows.append(
+                build_candidate_evidence_row(
+                    source_row=source_row,
+                    environment=self.environment,
+                    question=self.question,
+                    probe=presented_probe,
+                    system_prompt=self.system_prompt,
+                    tokenizer_binding=self.tokenizer_binding,
+                )
+            )
         source_ids = [str(row["row_id"]) for row in source_dataset]
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -317,6 +506,11 @@ class CandidateEvidenceDatasetGenerator:
             "source_dataset_fingerprint": stable_row_id({"row_ids": source_ids}),
             "num_question_sets": source_dataset.manifest.get("num_question_sets"),
             "patterns_per_question_set": source_dataset.manifest.get("patterns_per_question_set"),
+            "presentations_per_scenario": source_dataset.manifest.get(
+                "presentations_per_scenario", 1
+            ),
+            "rows_per_question_set": source_dataset.manifest.get("rows_per_question_set"),
+            "control_positional_bias": self.environment.control_positional_bias,
             "n": self.environment.n,
             "k": self.environment.k,
             "reliabilities_exact": [str(value) for value in self.environment.reliabilities],
@@ -326,6 +520,7 @@ class CandidateEvidenceDatasetGenerator:
                 "allow_same": self.probe.allow_same,
                 "reasoning_budget": self.probe.reasoning_budget,
                 "call_layout": self.probe.call_layout,
+                "answer_prefix": self.probe.answer_prefix,
             },
             "question": {
                 "agreement_surface": self.question.agreement_surface,
@@ -489,11 +684,13 @@ def summarize_representation_control(
 def exact_pattern_mass(dataset: TranscriptDataset, question_set_index: int) -> Fraction:
     """Convenience used by notebooks/tests to verify exact normalization."""
 
-    return sum(
-        (
-            Fraction(str(row["prior_predictive_exact"]))
-            for row in dataset
-            if row["question_set_index"] == question_set_index
-        ),
-        Fraction(0),
-    )
+    masses_by_pattern: dict[int, Fraction] = {}
+    for row in dataset:
+        if row["question_set_index"] != question_set_index:
+            continue
+        pattern_index = int(row["answer_pattern_index"])
+        mass = Fraction(str(row["prior_predictive_exact"]))
+        previous = masses_by_pattern.setdefault(pattern_index, mass)
+        if previous != mass:
+            raise ValueError("Presentation-order pair has inconsistent prior-predictive mass.")
+    return sum(masses_by_pattern.values(), Fraction(0))

@@ -148,9 +148,13 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
     assert all(row["assistant_completion"] == "ANSWER:1" for row in results)
     assert all(row["strict_answer_compliance"] is True for row in results)
     assert all(row["answer_messages"][-1] == {
-        "role": "assistant", "content": "ANSWER:"
+        "role": "assistant", "content": "1\nANSWER:"
     } for row in results)
-    assert all(row["answer_serialized_prompt"].endswith("<assistant>ANSWER:") for row in results)
+    assert all(
+        row["answer_serialized_prompt"].endswith("<assistant>1\nANSWER:")
+        for row in results
+    )
+    assert all("Now provide only" not in row["answer_serialized_prompt"] for row in results)
     assert all(row["answer_surfaces"]["X"] == "1" for row in results)
     assert all(row["answer_surfaces"]["Y"] == "2" for row in results)
     assert all(row["answer_surface_token_ids"]["X"] == [ord("1") + 3] for row in results)
@@ -188,6 +192,77 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
     resumed = runner.execute(dataset, config)
     assert len(resumed) == 2
     assert model.generate_calls == 2
+
+
+def test_runner_executes_mixed_reasoning_probe_parameterizations(tmp_path: Path) -> None:
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="3/4", control_positional_bias=True
+        ),
+        FixedSubsetQuestion([[1]]),
+        (
+            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=3),
+        ),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    results = QwenRunner(
+        model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="mixed_budgets", batch_size=4),
+    )
+
+    assert len(results) == 8
+    zero_budget = [row for row in results if row["reasoning_budget"] == 0]
+    positive_budget = [row for row in results if row["reasoning_budget"] == 3]
+    assert len(zero_budget) == len(positive_budget) == 4
+    assert all(row["answer_messages"][-1]["content"] == "ANSWER:" for row in zero_budget)
+    assert all(
+        row["answer_messages"][-1]["content"] == "1\nANSWER:"
+        for row in positive_budget
+    )
+    assert all(
+        row["answer_messages"][-1]["role"] == "assistant"
+        and "Now provide only" not in row["answer_serialized_prompt"]
+        for row in positive_budget
+    )
+    assert all(row["strict_answer_compliance"] is True for row in results)
+
+
+def test_runner_reorients_positional_metrics_to_canonical_candidates(tmp_path: Path) -> None:
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="3/4", control_positional_bias=True
+        ),
+        FixedSubsetQuestion([[1]]),
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    results = QwenRunner(
+        model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="positional", batch_size=2),
+    )
+
+    assert len(results) == 4
+    assert [row["model_choice"] for row in results] == ["X", "Y", "X", "Y"]
+    assert all(row["model_choice_candidate"] == "1" for row in results)
+    assert all(row["model_choice_canonical"] == "C1" for row in results)
+    assert all(row["candidate_1_sequence_log_probability"] == pytest.approx(
+        row["sequence_log_probabilities"]["1"]
+    ) for row in results)
+    assert all(row["candidate_2_sequence_log_probability"] == pytest.approx(
+        row["sequence_log_probabilities"]["2"]
+    ) for row in results)
+    assert all(row["candidate_1_minus_candidate_2_logit"] == pytest.approx(2) for row in results)
+    for pattern_index in range(2):
+        first, second = results[pattern_index * 2 : pattern_index * 2 + 2]
+        assert first["x_minus_y_logit"] == pytest.approx(2)
+        assert second["x_minus_y_logit"] == pytest.approx(-2)
 
 
 def test_oom_recursively_splits_batches(tmp_path: Path) -> None:

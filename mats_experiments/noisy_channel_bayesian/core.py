@@ -68,12 +68,15 @@ class NoisyChannelBayesianEnvironment:
     n: int = 8
     k: int = 3
     r_values: int | float | str | Fraction | Sequence[int | float | str | Fraction] = Fraction(3, 4)
+    control_positional_bias: bool = False
 
     def __post_init__(self) -> None:
         if self.n < 1:
             raise ValueError("n must be positive.")
         if self.k < 1:
             raise ValueError("k must be positive.")
+        if not isinstance(self.control_positional_bias, bool):
+            raise TypeError("control_positional_bias must be a bool.")
         values = self.r_values
         if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
             resolved = tuple(as_fraction(value) for value in values)
@@ -300,6 +303,25 @@ def exact_bayesian_target(
     if total == 0:
         return evidence, None
     return evidence, {candidate: value / total for candidate, value in likelihoods.items()}
+
+
+def candidate_agreements(
+    *,
+    membership_sets: Sequence[Sequence[int]],
+    reports: Sequence[str],
+    candidate: int,
+) -> list[int]:
+    """Return per-question agreement between a candidate and the observed reports."""
+
+    if len(membership_sets) != len(reports):
+        raise ValueError("membership_sets and reports must have equal lengths.")
+    flags: list[int] = []
+    for membership, report in zip(membership_sets, reports):
+        if report not in (YES, NO):
+            raise ValueError(f"Unknown report {report!r}.")
+        predicted_report = YES if candidate in set(membership) else NO
+        flags.append(int(report == predicted_report))
+    return flags
 
 
 def reliability_surface(value: Fraction) -> str:
@@ -599,26 +621,36 @@ def stage_two_messages(
     first_messages: Sequence[Mapping[str, str]],
     enforced_reasoning: str,
     layout: CallLayout,
+    answer_prefix: str = "ANSWER:",
 ) -> list[dict[str, str]]:
+    """Build a continued-assistant prefill containing reasoning then the answer marker.
+
+    The generated reasoning is fixed context for the answer call. Keeping it and
+    ``answer_prefix`` in the same final assistant message guarantees that the logits
+    at the answer boundary are measured immediately after ``ANSWER:``, without an
+    intervening user turn.
+    """
+
     if not first_messages:
         raise ValueError("first_messages must not be empty.")
+    if not answer_prefix or answer_prefix != answer_prefix.strip() or "\n" in answer_prefix:
+        raise ValueError(
+            "answer_prefix must be non-empty, single-line, and have no surrounding whitespace."
+        )
+    assistant_prefill = f"{enforced_reasoning.rstrip()}\n{answer_prefix}"
     if layout == "conversation":
         return [
             *(dict(message) for message in first_messages),
-            {"role": "assistant", "content": enforced_reasoning},
-            {
-                "role": "user",
-                "content": "Now provide only the final answer in the required format.",
-            },
+            {"role": "assistant", "content": assistant_prefill},
         ]
     if layout == "replay_user":
         system = [dict(message) for message in first_messages if message["role"] == "system"]
         user = next(message["content"] for message in first_messages if message["role"] == "user")
-        replay = (
-            f"{user}\n{enforced_reasoning}\n"
-            "Now provide only the final answer in the required format."
-        )
-        return [*system, {"role": "user", "content": replay}]
+        return [
+            *system,
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant_prefill},
+        ]
     raise ValueError(f"Unknown call layout {layout!r}.")
 
 
@@ -736,6 +768,61 @@ def _posterior_target_fields(
     }
 
 
+def _canonical_candidate_target_fields(
+    *,
+    posterior: Mapping[int, Fraction] | None,
+    candidate_1: int,
+    candidate_2: int,
+    allow_same: bool,
+) -> dict[str, object]:
+    """Posterior fields whose C1/C2 orientation is invariant to presentation order."""
+
+    if posterior is None:
+        return {
+            "candidate_1_posterior_exact": None,
+            "candidate_2_posterior_exact": None,
+            "candidate_1_posterior": None,
+            "candidate_2_posterior": None,
+            "candidate_1_minus_candidate_2_posterior": None,
+            "candidate_1_minus_candidate_2_log_odds": None,
+            "candidate_1_minus_candidate_2_log_odds_base": SOFTMAX_LOG_BASE,
+            "candidate_1_minus_candidate_2_log_odds_unit": SOFTMAX_LOG_UNIT,
+            "canonical_ground_truth_choice": None,
+            "canonical_normative_comparison": None,
+        }
+    candidate_1_probability = posterior[candidate_1]
+    candidate_2_probability = posterior[candidate_2]
+    if candidate_1_probability > candidate_2_probability:
+        comparison = "C1"
+    elif candidate_2_probability > candidate_1_probability:
+        comparison = "C2"
+    else:
+        comparison = "SAME"
+    ground_truth = comparison if comparison != "SAME" or allow_same else None
+    if candidate_1_probability > 0 and candidate_2_probability > 0:
+        log_odds: float | None = natural_log_ratio(
+            candidate_1_probability, candidate_2_probability
+        )
+    elif candidate_1_probability == candidate_2_probability:
+        log_odds = 0.0
+    else:
+        log_odds = None
+    return {
+        "candidate_1_posterior_exact": fraction_text(candidate_1_probability),
+        "candidate_2_posterior_exact": fraction_text(candidate_2_probability),
+        "candidate_1_posterior": float(candidate_1_probability),
+        "candidate_2_posterior": float(candidate_2_probability),
+        "candidate_1_minus_candidate_2_posterior": float(
+            candidate_1_probability - candidate_2_probability
+        ),
+        "candidate_1_minus_candidate_2_log_odds": log_odds,
+        "candidate_1_minus_candidate_2_log_odds_base": SOFTMAX_LOG_BASE,
+        "candidate_1_minus_candidate_2_log_odds_unit": SOFTMAX_LOG_UNIT,
+        "canonical_ground_truth_choice": ground_truth,
+        "canonical_normative_comparison": comparison,
+    }
+
+
 def build_candidate_evidence_row(
     *,
     source_row: Mapping[str, object],
@@ -765,6 +852,12 @@ def build_candidate_evidence_row(
         raise ValueError("Reduced and raw probes must use the same allow_same policy.")
     if str(source_row.get("answer_prefix", "ANSWER:")) != probe.answer_prefix:
         raise ValueError("Reduced and raw probes must use the same answer prefix.")
+    if bool(source_row.get("control_positional_bias", False)) != environment.control_positional_bias:
+        raise ValueError("Reduced and raw environments disagree on positional-bias control.")
+    candidate_1 = int(source_row.get("candidate_1", probe.x))
+    candidate_2 = int(source_row.get("candidate_2", probe.y))
+    if {probe.x, probe.y} != {candidate_1, candidate_2}:
+        raise ValueError("Source presented candidates do not match canonical C1/C2 candidates.")
 
     reliabilities = tuple(
         as_fraction(str(value))
@@ -784,6 +877,12 @@ def build_candidate_evidence_row(
         reliabilities=reliabilities,
     )
     target_fields = _posterior_target_fields(posterior=posterior, probe=probe)
+    canonical_target_fields = _canonical_candidate_target_fields(
+        posterior=posterior,
+        candidate_1=candidate_1,
+        candidate_2=candidate_2,
+        allow_same=probe.allow_same,
+    )
     if source_row.get("prior_predictive_exact") != fraction_text(evidence_mass):
         raise ValueError("Source prior-predictive mass failed exact recomputation.")
     if source_row.get("posterior_exact") != target_fields["posterior_exact"]:
@@ -852,6 +951,18 @@ def build_candidate_evidence_row(
         "reliabilities_exact": [fraction_text(value) for value in reliabilities],
         "reliabilities": [float(value) for value in reliabilities],
         "shared_reliability": environment.shared_reliability,
+        "control_positional_bias": environment.control_positional_bias,
+        "presentations_per_scenario": int(
+            source_row.get("presentations_per_scenario", 1)
+        ),
+        "positional_control_pair_id": source_row.get("positional_control_pair_id"),
+        "presentation_index": int(source_row.get("presentation_index", 0)),
+        "presentation_order": source_row.get("presentation_order", "C1_C2"),
+        "candidate_1": candidate_1,
+        "candidate_2": candidate_2,
+        "candidate_1_position": int(source_row.get("candidate_1_position", 1)),
+        "candidate_2_position": int(source_row.get("candidate_2_position", 2)),
+        "candidate_value_order": [probe.x, probe.y],
         "x": probe.x,
         "y": probe.y,
         "allow_same": probe.allow_same,
@@ -874,7 +985,32 @@ def build_candidate_evidence_row(
         "prior_predictive": float(evidence_mass),
         "posterior_state": ("defined" if posterior is not None else "undefined_zero_evidence"),
         **target_fields,
+        **canonical_target_fields,
     }
+    candidate_1_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=candidate_1
+    )
+    candidate_2_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=candidate_2
+    )
+    x_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=probe.x
+    )
+    y_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=probe.y
+    )
+    row.update(
+        {
+            "agreement_x_by_question": x_flags,
+            "agreement_y_by_question": y_flags,
+            "total_agreement_x": sum(x_flags),
+            "total_agreement_y": sum(y_flags),
+            "agreement_candidate_1_by_question": candidate_1_flags,
+            "agreement_candidate_2_by_question": candidate_2_flags,
+            "total_agreement_candidate_1": sum(candidate_1_flags),
+            "total_agreement_candidate_2": sum(candidate_2_flags),
+        }
+    )
     return row
 
 
@@ -886,12 +1022,40 @@ def build_row(
     reports: Sequence[str],
     answer_pattern_index: int,
     probe: XVsYPosteriorProbe,
+    canonical_probe: XVsYPosteriorProbe | None = None,
+    presentation_index: int = 0,
+    parameterization_index: int = 0,
+    environment_parameter_index: int = 0,
+    question_parameter_index: int = 0,
+    probe_parameter_index: int = 0,
     system_prompt: SystemPrompt,
     tokenizer_binding: TokenizerBinding,
 ) -> dict[str, object]:
+    canonical_probe = probe if canonical_probe is None else canonical_probe
+    candidate_1 = canonical_probe.x
+    candidate_2 = canonical_probe.y
+    if {probe.x, probe.y} != {candidate_1, candidate_2}:
+        raise ValueError("Presented probe candidates must match canonical C1/C2 candidates.")
+    for field_name in ("allow_same", "reasoning_budget", "call_layout", "answer_prefix"):
+        if getattr(probe, field_name) != getattr(canonical_probe, field_name):
+            raise ValueError(f"Presented and canonical probes disagree on {field_name}.")
+    presentation_count = 2 if environment.control_positional_bias else 1
+    if presentation_index not in range(presentation_count):
+        raise ValueError(
+            f"presentation_index must lie in 0..{presentation_count - 1} for this environment."
+        )
+    expected_order = (
+        (candidate_1, candidate_2) if presentation_index == 0 else (candidate_2, candidate_1)
+    )
+    if (probe.x, probe.y) != expected_order:
+        raise ValueError("Presented probe order does not match presentation_index.")
+
+    membership_sets = [
+        list(question["membership_set"]) for question in questions  # type: ignore[arg-type]
+    ]
     evidence, posterior = exact_bayesian_target(
         domain=environment.domain,
-        membership_sets=[question["membership_set"] for question in questions],  # type: ignore[list-item]
+        membership_sets=membership_sets,
         reports=reports,
         reliabilities=environment.reliabilities,
     )
@@ -909,8 +1073,30 @@ def build_row(
     serialized_prompt = tokenizer_binding.serialize(messages)
     input_ids = tokenizer_binding.input_ids(messages)
     pattern_surface = "".join("Y" if report == YES else "N" for report in reports)
+    presentation_order = "C1_C2" if presentation_index == 0 else "C2_C1"
+    pair_identity = {
+        "schema_version": SCHEMA_VERSION,
+        "question_set_index": question_set_index,
+        "answer_pattern_index": answer_pattern_index,
+        "membership_sets": membership_sets,
+        "reports": list(reports),
+        "reliabilities": [fraction_text(value) for value in environment.reliabilities],
+        "candidate_1": candidate_1,
+        "candidate_2": candidate_2,
+        "allow_same": canonical_probe.allow_same,
+        "reasoning_budget": canonical_probe.reasoning_budget,
+        "call_layout": canonical_probe.call_layout,
+        "answer_prefix": canonical_probe.answer_prefix,
+        "system_prompt": system_prompt.content,
+        "tokenizer_template_fingerprint": tokenizer_binding.fingerprint,
+    }
+    positional_control_pair_id = stable_row_id(pair_identity)
     identity = {
         "schema_version": SCHEMA_VERSION,
+        "control_positional_bias": environment.control_positional_bias,
+        "positional_control_pair_id": positional_control_pair_id,
+        "presentation_index": presentation_index,
+        "presentation_order": presentation_order,
         "question_set_index": question_set_index,
         "answer_pattern_index": answer_pattern_index,
         "answer_pattern": pattern_surface,
@@ -932,6 +1118,10 @@ def build_row(
     row: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "row_id": stable_row_id(identity),
+        "parameterization_index": parameterization_index,
+        "environment_parameter_index": environment_parameter_index,
+        "question_parameter_index": question_parameter_index,
+        "probe_parameter_index": probe_parameter_index,
         "question_set_index": question_set_index,
         "answer_pattern_index": answer_pattern_index,
         "answer_pattern": pattern_surface,
@@ -941,8 +1131,18 @@ def build_row(
         "reliabilities_exact": [fraction_text(value) for value in environment.reliabilities],
         "reliabilities": [float(value) for value in environment.reliabilities],
         "shared_reliability": environment.shared_reliability,
+        "control_positional_bias": environment.control_positional_bias,
+        "presentations_per_scenario": presentation_count,
+        "positional_control_pair_id": positional_control_pair_id,
+        "presentation_index": presentation_index,
+        "presentation_order": presentation_order,
+        "candidate_1": candidate_1,
+        "candidate_2": candidate_2,
+        "candidate_1_position": 1 if probe.x == candidate_1 else 2,
+        "candidate_2_position": 1 if probe.x == candidate_2 else 2,
+        "candidate_value_order": [probe.x, probe.y],
         "questions": [dict(question) for question in questions],
-        "membership_sets": [list(question["membership_set"]) for question in questions],  # type: ignore[arg-type]
+        "membership_sets": membership_sets,
         "observed_reports": list(reports),
         "x": probe.x,
         "y": probe.y,
@@ -958,61 +1158,37 @@ def build_row(
         "prior_predictive": float(evidence),
         "posterior_state": "defined" if posterior is not None else "undefined_zero_evidence",
     }
-    if posterior is None:
-        row.update(
-            {
-                "posterior_exact": None,
-                "posterior": None,
-                "x_posterior_exact": None,
-                "y_posterior_exact": None,
-                "x_posterior": None,
-                "y_posterior": None,
-                "posterior_difference": None,
-                "posterior_log_odds": None,
-                "posterior_log_odds_base": SOFTMAX_LOG_BASE,
-                "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
-                "ground_truth_choice": None,
-                "normative_comparison": None,
-            }
-        )
-        return row
-    x_probability = posterior[probe.x]
-    y_probability = posterior[probe.y]
-    if x_probability > y_probability:
-        comparison = "X"
-    elif y_probability > x_probability:
-        comparison = "Y"
-    else:
-        comparison = "SAME"
-    ground_truth = comparison if comparison != "SAME" or probe.allow_same else None
-    if x_probability > 0 and y_probability > 0:
-        log_odds: float | None = natural_log_ratio(x_probability, y_probability)
-    elif x_probability == y_probability:
-        log_odds = 0.0
-    else:
-        # The finite real-valued log-odds is undefined at probability endpoints.
-        log_odds = None
+    x_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=probe.x
+    )
+    y_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=probe.y
+    )
+    candidate_1_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=candidate_1
+    )
+    candidate_2_flags = candidate_agreements(
+        membership_sets=membership_sets, reports=reports, candidate=candidate_2
+    )
     row.update(
         {
-            # These candidate posteriors are deterministic functions of the displayed
-            # transcript and are deliberately part of the persisted target schema.
-            "posterior_exact": {
-                str(candidate): fraction_text(probability)
-                for candidate, probability in posterior.items()
-            },
-            "posterior": {
-                str(candidate): float(probability) for candidate, probability in posterior.items()
-            },
-            "x_posterior_exact": fraction_text(x_probability),
-            "y_posterior_exact": fraction_text(y_probability),
-            "x_posterior": float(x_probability),
-            "y_posterior": float(y_probability),
-            "posterior_difference": float(x_probability - y_probability),
-            "posterior_log_odds": log_odds,
-            "posterior_log_odds_base": SOFTMAX_LOG_BASE,
-            "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
-            "ground_truth_choice": ground_truth,
-            "normative_comparison": comparison,
+            "agreement_x_by_question": x_flags,
+            "agreement_y_by_question": y_flags,
+            "total_agreement_x": sum(x_flags),
+            "total_agreement_y": sum(y_flags),
+            "agreement_candidate_1_by_question": candidate_1_flags,
+            "agreement_candidate_2_by_question": candidate_2_flags,
+            "total_agreement_candidate_1": sum(candidate_1_flags),
+            "total_agreement_candidate_2": sum(candidate_2_flags),
         }
+    )
+    row.update(_posterior_target_fields(posterior=posterior, probe=probe))
+    row.update(
+        _canonical_candidate_target_fields(
+            posterior=posterior,
+            candidate_1=candidate_1,
+            candidate_2=candidate_2,
+            allow_same=canonical_probe.allow_same,
+        )
     )
     return row

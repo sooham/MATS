@@ -80,6 +80,121 @@ def test_exhaustive_patterns_reproducibility_and_question_independence() -> None
         assert exact_pattern_mass(first, question_set) == 1
 
 
+def test_positional_control_pairs_each_evidence_scenario_in_both_orders() -> None:
+    dataset = generator(
+        environment=NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="3/4", control_positional_bias=True
+        ),
+        question=FixedSubsetQuestion([[1]]),
+        probe=XVsYPosteriorProbe(x=1, y=2),
+    ).generate(num_question_sets=1)
+
+    assert len(dataset) == 4
+    assert dataset.manifest["control_positional_bias"] is True
+    assert dataset.manifest["presentations_per_scenario"] == 2
+    assert [(row["answer_pattern"], row["x"], row["y"]) for row in dataset] == [
+        ("Y", 1, 2),
+        ("Y", 2, 1),
+        ("N", 1, 2),
+        ("N", 2, 1),
+    ]
+    for pattern_index in range(2):
+        first, second = dataset[pattern_index * 2 : pattern_index * 2 + 2]
+        assert first["positional_control_pair_id"] == second["positional_control_pair_id"]
+        assert first["presentation_order"] == "C1_C2"
+        assert second["presentation_order"] == "C2_C1"
+        assert first["candidate_1"] == second["candidate_1"] == 1
+        assert first["candidate_2"] == second["candidate_2"] == 2
+        assert first["membership_sets"] == second["membership_sets"]
+        assert first["observed_reports"] == second["observed_reports"]
+        assert first["prior_predictive_exact"] == second["prior_predictive_exact"]
+        assert first["posterior_exact"] == second["posterior_exact"]
+        assert first["agreement_candidate_1_by_question"] == second[
+            "agreement_candidate_1_by_question"
+        ]
+        assert first["agreement_candidate_2_by_question"] == second[
+            "agreement_candidate_2_by_question"
+        ]
+        assert first["posterior_log_odds"] == pytest.approx(
+            -float(second["posterior_log_odds"])
+        )
+        assert first["candidate_1_minus_candidate_2_log_odds"] == pytest.approx(
+            float(second["candidate_1_minus_candidate_2_log_odds"])
+        )
+    assert exact_pattern_mass(dataset, 0) == 1
+
+    with pytest.raises(TypeError, match="control_positional_bias"):
+        NoisyChannelBayesianEnvironment(control_positional_bias=1)  # type: ignore[arg-type]
+
+
+def test_generator_parameter_axes_form_a_cartesian_product() -> None:
+    environments = (
+        NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="3/4", control_positional_bias=True
+        ),
+        NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="2/3", control_positional_bias=True
+        ),
+    )
+    questions = (FixedSubsetQuestion([[1]]), FixedSubsetQuestion([[2]]))
+    probes = (
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=10),
+    )
+    dataset = TranscriptDatasetGenerator(
+        environment=environments,
+        question=questions,
+        probe=probes,
+        tokenizer_binding=TokenizerBinding(TinyTokenizer()),
+        system_prompt=SystemPrompt("Be a careful Bayesian."),
+        seed=17,
+    ).generate(num_question_sets=1)
+
+    assert len(dataset) == 2 * 2 * 2 * 2 * 2
+    assert dataset.manifest["parameterization_count"] == 8
+    assert dataset.manifest["environment_parameter_count"] == 2
+    assert dataset.manifest["question_parameter_count"] == 2
+    assert dataset.manifest["probe_parameter_count"] == 2
+    assert dataset.manifest["reasoning_budgets"] == [0, 10]
+    assert dataset.manifest["rows_per_question_set"] == len(dataset)
+    assert {
+        (
+            row["environment_parameter_index"],
+            row["question_parameter_index"],
+            row["probe_parameter_index"],
+        )
+        for row in dataset
+    } == {(environment, question, probe) for environment in range(2)
+          for question in range(2) for probe in range(2)}
+
+
+def test_reasoning_probe_sweep_reuses_one_question_bank() -> None:
+    budgets = tuple(range(0, 200, 10))
+    dataset = TranscriptDatasetGenerator(
+        environment=NoisyChannelBayesianEnvironment(
+            n=2, k=1, r_values="3/4", control_positional_bias=True
+        ),
+        question=FixedSubsetQuestion([[1]]),
+        probe=tuple(
+            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=budget)
+            for budget in budgets
+        ),
+        tokenizer_binding=TokenizerBinding(TinyTokenizer()),
+    ).generate(num_question_sets=1)
+
+    assert len(budgets) == 20
+    assert len(dataset) == 20 * 2 * 1 * 2
+    assert dataset.manifest["reasoning_budgets"] == list(budgets)
+    assert all(
+        sum(row["reasoning_budget"] == budget for row in dataset) == 4
+        for budget in budgets
+    )
+    assert len({
+        tuple(tuple(values) for values in row["membership_sets"])
+        for row in dataset
+    }) == 1
+
+
 def test_exact_scalar_and_per_question_reliabilities() -> None:
     evidence, posterior = exact_bayesian_target(
         domain=[1, 2],
@@ -184,14 +299,13 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
     conversation = stage_two_messages(
         first_messages=base, enforced_reasoning="work", layout="conversation"
     )
-    assert [message["role"] for message in conversation] == ["user", "assistant", "user"]
+    assert [message["role"] for message in conversation] == ["user", "assistant"]
+    assert conversation[-1]["content"] == "work\nANSWER:"
     replay = stage_two_messages(
         first_messages=base, enforced_reasoning="work", layout="replay_user"
     )
-    assert len(replay) == 1
-    assert replay[0]["content"].endswith(
-        "work\nNow provide only the final answer in the required format."
-    )
+    assert [message["role"] for message in replay] == ["user", "assistant"]
+    assert replay[-1]["content"] == "work\nANSWER:"
 
     tied = generator(
         environment=NoisyChannelBayesianEnvironment(n=2, k=1, r_values=Fraction(1, 2)),
@@ -229,6 +343,8 @@ def test_probe_values_are_the_model_facing_answer_surfaces(reasoning_budget: int
     assert "where X means" not in prompt
     if reasoning_budget:
         assert "Reason carefully from the raw observations" in prompt
+        assert "output exactly one of: ANSWER:2 | ANSWER:7" in prompt
+        assert "ANSWER:SAME" not in prompt
         assert "Do not provide reasoning" not in prompt
         assert prompt.endswith("REASONING:")
     else:

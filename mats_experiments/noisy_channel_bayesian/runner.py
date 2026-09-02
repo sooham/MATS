@@ -376,11 +376,11 @@ class QwenRunner:
                 rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
         if not isinstance(rendered, str):
             raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
-        answer_prefix = str(messages[-1]["content"])
-        if not rendered.endswith(answer_prefix):
+        assistant_prefill = str(messages[-1]["content"])
+        if not rendered.endswith(assistant_prefill):
             raise ValueError(
-                "The tokenizer closed or altered the assistant answer prefill; candidate logits "
-                "would not be measured immediately after the configured answer prefix."
+                "The tokenizer closed or altered the continued assistant prefill; candidate "
+                "logits would not be measured immediately after the configured answer prefix."
             )
         return rendered
 
@@ -880,6 +880,7 @@ class QwenRunner:
         enforced_by_id: dict[str, str] = {}
         for row in pending:
             row_id = str(row["row_id"])
+            answer_prefix = str(row.get("answer_prefix", "ANSWER:"))
             if int(row["reasoning_budget"]) > 0:
                 enforced = enforce_reasoning(
                     str(reasoning_results[row_id]["text"]), int(row["reasoning_budget"])
@@ -889,16 +890,17 @@ class QwenRunner:
                     first_messages=row["messages"],  # type: ignore[arg-type]
                     enforced_reasoning=enforced,
                     layout=str(row["call_layout"]),  # type: ignore[arg-type]
+                    answer_prefix=answer_prefix,
                 )
+                messages = base_messages
             else:
                 base_messages = [  # type: ignore[union-attr]
                     dict(message) for message in row["messages"]
                 ]
-            answer_prefix = str(row.get("answer_prefix", "ANSWER:"))
-            messages = [
-                *base_messages,
-                {"role": "assistant", "content": answer_prefix},
-            ]
+                messages = [
+                    *base_messages,
+                    {"role": "assistant", "content": answer_prefix},
+                ]
             prompt = self._serialize_continued_assistant(messages)
             answer_messages[row_id] = messages
             answer_items.append((row_id, prompt))
@@ -958,8 +960,56 @@ class QwenRunner:
                     strict=True,
                     answer_prefix=str(source.get("answer_prefix", "ANSWER:")),
                 )
+                candidate_1 = int(source.get("candidate_1", source["x"]))
+                candidate_2 = int(source.get("candidate_2", source["y"]))
+                x_is_candidate_1 = int(source["x"]) == candidate_1
+                if choice == "SAME":
+                    canonical_choice = "SAME"
+                    chosen_candidate = "SAME"
+                elif choice == "X":
+                    chosen_value = int(source["x"])
+                    chosen_candidate = str(chosen_value)
+                    if chosen_value == candidate_1:
+                        canonical_choice = "C1"
+                    elif chosen_value == candidate_2:
+                        canonical_choice = "C2"
+                    else:
+                        raise ValueError("Parsed choice is not one of the canonical candidates.")
+                elif choice == "Y":
+                    chosen_value = int(source["y"])
+                    chosen_candidate = str(chosen_value)
+                    if chosen_value == candidate_1:
+                        canonical_choice = "C1"
+                    elif chosen_value == candidate_2:
+                        canonical_choice = "C2"
+                    else:
+                        raise ValueError("Parsed choice is not one of the canonical candidates.")
+                else:
+                    canonical_choice = None
+                    chosen_candidate = None
                 ground_truth = source.get("ground_truth_choice")
                 posterior_correct = choice == ground_truth if ground_truth is not None else None
+                canonical_ground_truth = source.get("canonical_ground_truth_choice")
+                canonical_posterior_correct = (
+                    canonical_choice == canonical_ground_truth
+                    if canonical_ground_truth is not None
+                    else None
+                )
+                x_sequence_score = score_record.get("x_sequence_log_probability")
+                y_sequence_score = score_record.get("y_sequence_log_probability")
+                if x_is_candidate_1:
+                    candidate_1_sequence_score = x_sequence_score
+                    candidate_2_sequence_score = y_sequence_score
+                else:
+                    candidate_1_sequence_score = y_sequence_score
+                    candidate_2_sequence_score = x_sequence_score
+                positional_logit_difference = score_record.get("x_minus_y_logit")
+                canonical_logit_difference = (
+                    float(positional_logit_difference)
+                    * (1.0 if x_is_candidate_1 else -1.0)
+                    if positional_logit_difference is not None
+                    else None
+                )
                 reasoning = reasoning_results.get(row_id)
                 reasoning_prompt_record = reasoning_prompt_records.get(row_id)
                 answer_prompt_record = answer_prompt_records[row_id]
@@ -988,13 +1038,19 @@ class QwenRunner:
                     "model_choice_surface": (
                         answer_surfaces[choice] if choice is not None else None  # type: ignore[index]
                     ),
+                    "model_choice_candidate": chosen_candidate,
+                    "model_choice_canonical": canonical_choice,
                     "parse_compliance": choice is not None,
                     "strict_answer_compliance": choice is not None,
                     "zero_reasoning_compliance": (
                         choice is not None if int(source["reasoning_budget"]) == 0 else None
                     ),
                     "posterior_correct": posterior_correct,
+                    "canonical_posterior_correct": canonical_posterior_correct,
                     **score_record,
+                    "candidate_1_sequence_log_probability": candidate_1_sequence_score,
+                    "candidate_2_sequence_log_probability": candidate_2_sequence_score,
+                    "candidate_1_minus_candidate_2_logit": canonical_logit_difference,
                     **capture_paths.get(row_id, {}),
                     "generation_settings": {
                         "do_sample": False,
