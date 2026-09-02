@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 import re
@@ -42,6 +43,11 @@ class ExecutionConfig:
     experiment_dir: str | Path | None = None
     run_id: str = "default"
     batch_size: int = 2
+    reasoning_batch_size: int | None = None
+    answer_batch_size: int | None = None
+    capture_batch_size: int | None = None
+    score_batch_size: int | None = None
+    checkpoint_every_batches: int = 25
     max_answer_tokens: int = 8
     max_reasoning_tokens: int = 256
     resume: bool = True
@@ -52,10 +58,32 @@ class ExecutionConfig:
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError("batch_size must be positive.")
+        stage_batch_sizes = {
+            "reasoning_batch_size": self.reasoning_batch_size,
+            "answer_batch_size": self.answer_batch_size,
+            "capture_batch_size": self.capture_batch_size,
+            "score_batch_size": self.score_batch_size,
+        }
+        invalid = [name for name, value in stage_batch_sizes.items() if value is not None and value < 1]
+        if invalid:
+            raise ValueError(f"Stage batch sizes must be positive: {', '.join(invalid)}.")
+        if self.checkpoint_every_batches < 1:
+            raise ValueError("checkpoint_every_batches must be positive.")
         if self.max_answer_tokens < 1 or self.max_reasoning_tokens < 1:
             raise ValueError("Generation token limits must be positive.")
         if not self.run_id or Path(self.run_id).name != self.run_id:
             raise ValueError("run_id must be one non-empty path component.")
+
+    def batch_size_for(self, stage: str) -> int:
+        overrides = {
+            "reasoning": self.reasoning_batch_size,
+            "answer": self.answer_batch_size,
+            "capture": self.capture_batch_size,
+            "score": self.score_batch_size,
+        }
+        if stage not in overrides:
+            raise ValueError(f"Unknown execution stage {stage!r}.")
+        return overrides[stage] or self.batch_size
 
 
 def resolve_selector(selector: object, length: int) -> list[int]:
@@ -432,20 +460,29 @@ class QwenRunner:
         *,
         max_new_tokens: int,
         generation_kwargs: Mapping[str, object],
+        capture_first_token_logits: bool = False,
     ) -> dict[str, dict[str, object]]:
         import torch
 
         prompts = [prompt for _, prompt in items]
         encoded = self._encode_prompts(prompts)
         kwargs = {"do_sample": False, **dict(generation_kwargs)}
+        if capture_first_token_logits:
+            kwargs.update({"return_dict_in_generate": True, "output_logits": True})
         with torch.inference_mode():
             generated = self.model.generate(**encoded, max_new_tokens=max_new_tokens, **kwargs)
         sequences = generated.sequences if hasattr(generated, "sequences") else generated
+        generated_logits = getattr(generated, "logits", None)
+        first_token_logits = (
+            generated_logits[0].detach()
+            if generated_logits is not None and len(generated_logits) > 0
+            else None
+        )
         prefix_width = encoded["input_ids"].shape[1]
         continuation = sequences[:, prefix_width:]
         eos_ids = self._eos_ids()
         records: dict[str, dict[str, object]] = {}
-        for (row_id, _), tokens in zip(items, continuation):
+        for row_index, ((row_id, _), tokens) in enumerate(zip(items, continuation)):
             token_list = [int(token) for token in tokens.detach().cpu().tolist()]
             stop = next((index for index, token in enumerate(token_list) if token in eos_ids), None)
             effective = token_list if stop is None else token_list[:stop]
@@ -458,6 +495,8 @@ class QwenRunner:
                 "hit_token_cap": stop is None and len(token_list) >= max_new_tokens,
                 "effective_batch_size": len(items),
             }
+            if first_token_logits is not None:
+                records[row_id]["_first_token_logits"] = first_token_logits[row_index]
         self._effective_batch_sizes.append(len(items))
         return records
 
@@ -467,6 +506,7 @@ class QwenRunner:
         *,
         max_new_tokens: int,
         generation_kwargs: Mapping[str, object],
+        capture_first_token_logits: bool = False,
     ) -> dict[str, dict[str, object]]:
         if not items:
             return {}
@@ -475,6 +515,7 @@ class QwenRunner:
                 items,
                 max_new_tokens=max_new_tokens,
                 generation_kwargs=generation_kwargs,
+                capture_first_token_logits=capture_first_token_logits,
             )
         except RuntimeError as error:
             if not _is_oom(error) or len(items) == 1:
@@ -490,11 +531,13 @@ class QwenRunner:
                     items[:midpoint],
                     max_new_tokens=max_new_tokens,
                     generation_kwargs=generation_kwargs,
+                    capture_first_token_logits=capture_first_token_logits,
                 ),
                 **self._generate_resilient(
                     items[midpoint:],
                     max_new_tokens=max_new_tokens,
                     generation_kwargs=generation_kwargs,
+                    capture_first_token_logits=capture_first_token_logits,
                 ),
             }
 
@@ -505,6 +548,7 @@ class QwenRunner:
         batch_size: int,
         max_new_tokens: int,
         generation_kwargs: Mapping[str, object],
+        capture_first_token_logits: bool = False,
     ) -> dict[str, dict[str, object]]:
         ordered = sorted(items, key=lambda item: len(item[1]))
         result: dict[str, dict[str, object]] = {}
@@ -514,6 +558,7 @@ class QwenRunner:
                     ordered[start : start + batch_size],
                     max_new_tokens=max_new_tokens,
                     generation_kwargs=generation_kwargs,
+                    capture_first_token_logits=capture_first_token_logits,
                 )
             )
         return result
@@ -524,6 +569,26 @@ class QwenRunner:
         if ids and isinstance(ids[0], list):
             ids = ids[0]
         return [int(value) for value in ids]
+
+    def _supports_logits_to_keep(self) -> bool:
+        with contextlib.suppress(TypeError, ValueError):
+            return "logits_to_keep" in inspect.signature(self.model.forward).parameters
+        return False
+
+    def _surface_raw_logits(self, logits: Any, spec: MetricSpec) -> dict[str, object]:
+        selected: dict[str, object] = {}
+        for label in ("X", "Y"):
+            surface = spec.surfaces[label]
+            token_ids = self._surface_ids(surface)
+            if len(token_ids) != 1:
+                raise ValueError(
+                    f"Answer-surface logit capture requires a singleton token for {surface!r}."
+                )
+            values = logits[..., token_ids[0]].detach().float().cpu()
+            selected[surface] = (
+                float(values.item()) if values.ndim == 0 else values.tolist()
+            )
+        return selected
 
     def _prompt_token_record(self, prompt: str) -> dict[str, object]:
         """Return the exact, unpadded runtime-tokenizer representation of a prompt."""
@@ -669,7 +734,9 @@ class QwenRunner:
         spec: CaptureSpec,
         run_dir: Path,
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
-    ) -> dict[str, dict[str, str]]:
+        metric_specs: Mapping[str, MetricSpec] | None = None,
+        capture_logits: bool = True,
+    ) -> dict[str, dict[str, object]]:
         """Forward once and atomically split captured tensors into per-row files."""
 
         if not items or not spec.enabled:
@@ -700,30 +767,53 @@ class QwenRunner:
                 row[mask.to(dtype=torch.bool)].detach().cpu().tolist()
                 for row, mask in zip(encoded["input_ids"], encoded["attention_mask"])
             ]
+        wants_logits = capture_logits and boundary in spec.logits_boundaries
+        last_prompt_logits_only = (
+            wants_logits
+            and decode_token_ids is None
+            and spec.logit_tokens == "last"
+        )
+        forward_kwargs: dict[str, object] = {"use_cache": False}
+        if self._supports_logits_to_keep() and (not wants_logits or last_prompt_logits_only):
+            forward_kwargs["logits_to_keep"] = 1
         hooks = _ActivationHooks(self.model, spec)
         try:
             with torch.inference_mode():
-                output = self.model(**encoded, use_cache=False)
+                output = self.model(**encoded, **forward_kwargs)
         except Exception:
             hooks.clear()
             raise
         finally:
             hooks.close()
         logits = output.logits.detach()
-        per_row: dict[str, dict[str, str]] = {}
+        per_row: dict[str, dict[str, object]] = {}
         for row_index, (row_id, _) in enumerate(items):
             mask = encoded["attention_mask"][row_index].to(dtype=torch.bool)
             activation_tensors: dict[str, Any] = {}
             logit_tensors: dict[str, Any] = {}
-            if boundary in spec.logits_boundaries:
-                unpadded_logits = logits[row_index][mask]
+            surface_logits: dict[str, object] | None = None
+            if wants_logits:
+                if last_prompt_logits_only and logits.shape[1] == 1:
+                    unpadded_logits = logits[row_index]
+                else:
+                    unpadded_logits = logits[row_index][mask]
                 if decode_token_ids is not None and spec.every_decode_position:
                     count = len(decode_token_ids[row_id])
                     start = len(prompt_ids[row_index]) - 1
                     selected = unpadded_logits[start : start + count]
-                else:
+                elif spec.logit_tokens == "last":
                     selected = unpadded_logits[-1]
-                logit_tensors[f"{boundary}.logits"] = selected.float().cpu()
+                else:
+                    indices = resolve_selector(spec.logit_tokens, len(unpadded_logits))
+                    selected = unpadded_logits[indices]
+                if spec.logits_scope == "full":
+                    logit_tensors[f"{boundary}.logits"] = selected.float().cpu()
+                else:
+                    if metric_specs is None or row_id not in metric_specs:
+                        raise ValueError(
+                            "answer_surfaces logit capture requires a resolved MetricSpec."
+                        )
+                    surface_logits = self._surface_raw_logits(selected, metric_specs[row_id])
             for (stream, layer), tensor in hooks.buffers.items():
                 unpadded = tensor[row_index][mask]
                 if decode_token_ids is not None and spec.every_decode_position:
@@ -734,7 +824,7 @@ class QwenRunner:
                     indices = resolve_selector(spec.tokens, len(unpadded))
                     selected = unpadded[indices]
                 activation_tensors[f"{boundary}.{stream}.layer_{layer}"] = selected.detach().cpu()
-            paths: dict[str, str] = {}
+            paths: dict[str, object] = {}
             if activation_tensors:
                 path = run_dir / "activations" / f"{row_id}.safetensors"
                 # Multiple boundaries merge rather than replace a prior stage.
@@ -752,6 +842,8 @@ class QwenRunner:
                     logit_tensors = {**load_file(path), **logit_tensors}
                 _atomic_safetensors(path, logit_tensors)
                 paths["logit_path"] = str(path.relative_to(run_dir))
+            if surface_logits is not None:
+                paths[f"{boundary}_surface_raw_logits"] = surface_logits
             per_row[row_id] = paths
         hooks.clear()
         self._effective_capture_batch_sizes.append(len(items))
@@ -765,7 +857,9 @@ class QwenRunner:
         spec: CaptureSpec,
         run_dir: Path,
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
-    ) -> dict[str, dict[str, str]]:
+        metric_specs: Mapping[str, MetricSpec] | None = None,
+        capture_logits: bool = True,
+    ) -> dict[str, dict[str, object]]:
         """Retry capture OOMs by recursively splitting without retaining hook buffers."""
 
         try:
@@ -775,6 +869,8 @@ class QwenRunner:
                 spec=spec,
                 run_dir=run_dir,
                 decode_token_ids=decode_token_ids,
+                metric_specs=metric_specs,
+                capture_logits=capture_logits,
             )
         except RuntimeError as error:
             if not _is_oom(error) or len(items) == 1:
@@ -802,6 +898,8 @@ class QwenRunner:
                     spec=spec,
                     run_dir=run_dir,
                     decode_token_ids=first_ids,
+                    metric_specs=metric_specs,
+                    capture_logits=capture_logits,
                 ),
                 **self._capture_resilient(
                     items=items[midpoint:],
@@ -809,6 +907,8 @@ class QwenRunner:
                     spec=spec,
                     run_dir=run_dir,
                     decode_token_ids=second_ids,
+                    metric_specs=metric_specs,
+                    capture_logits=capture_logits,
                 ),
             }
 
@@ -842,38 +942,60 @@ class QwenRunner:
         reasoning_prompt_records = {
             row_id: self._prompt_token_record(prompt) for row_id, prompt in reasoning_items
         }
-        reasoning_results = self._run_bucketed(
-            reasoning_items,
-            batch_size=config.batch_size,
-            max_new_tokens=config.max_reasoning_tokens,
-            generation_kwargs=config.generation_kwargs,
-        )
+        reasoning_results: dict[str, dict[str, object]] = {}
+        reasoning_batch_size = config.batch_size_for("reasoning")
+        for reasoning_budget in sorted(
+            {int(row["reasoning_budget"]) for row in reasoning_rows}
+        ):
+            budget_row_ids = {
+                str(row["row_id"])
+                for row in reasoning_rows
+                if int(row["reasoning_budget"]) == reasoning_budget
+            }
+            budget_items = [item for item in reasoning_items if item[0] in budget_row_ids]
+            reasoning_results.update(
+                self._run_bucketed(
+                    budget_items,
+                    batch_size=reasoning_batch_size,
+                    max_new_tokens=config.max_reasoning_tokens,
+                    generation_kwargs=config.generation_kwargs,
+                )
+            )
         for completion in reasoning_results.values():
             raw_text = str(completion["text"])
             cleaned_text = strip_thinking_markers(raw_text)
             completion["raw_text"] = raw_text
             completion["text"] = cleaned_text
             completion["thinking_markers_removed"] = cleaned_text != raw_text.strip()
-        capture_paths: dict[str, dict[str, str]] = {}
+        capture_records: dict[str, dict[str, object]] = {}
         if "reasoning" in config.capture.logits_boundaries or config.capture.streams:
-            for start in range(0, len(reasoning_items), config.batch_size):
+            capture_batch_size = config.batch_size_for("capture")
+            reasoning_metric_specs = {
+                str(row["row_id"]): config.metrics.resolve(
+                    x=int(row["x"]), y=int(row["y"])
+                )
+                for row in reasoning_rows
+            }
+            for start in range(0, len(reasoning_items), capture_batch_size):
+                capture_items = reasoning_items[start : start + capture_batch_size]
                 reasoning_decode_ids = (
                     {
                         row_id: reasoning_results[row_id]["token_ids"]
-                        for row_id, _ in reasoning_items[start : start + config.batch_size]
+                        for row_id, _ in capture_items
                     }
                     if config.capture.every_decode_position
                     else None
                 )
                 captured = self._capture_resilient(
-                    items=reasoning_items[start : start + config.batch_size],
+                    items=capture_items,
                     boundary="reasoning",
                     spec=config.capture,
                     run_dir=run_dir,
                     decode_token_ids=reasoning_decode_ids,
+                    metric_specs=reasoning_metric_specs,
                 )
                 for row_id, paths in captured.items():
-                    capture_paths.setdefault(row_id, {}).update(paths)
+                    capture_records.setdefault(row_id, {}).update(paths)
 
         answer_items: list[tuple[str, str]] = []
         answer_messages: dict[str, list[dict[str, str]]] = {}
@@ -909,40 +1031,94 @@ class QwenRunner:
         }
         pending_by_id = {str(row["row_id"]): row for row in pending}
         ordered_answer_items = sorted(answer_items, key=lambda item: len(item[1]))
-        # A finalized result checkpoint is written after each successful answer minibatch.
-        for start in range(0, len(ordered_answer_items), config.batch_size):
-            chunk = ordered_answer_items[start : start + config.batch_size]
-            answer_results = self._generate_resilient(
-                chunk,
-                max_new_tokens=config.max_answer_tokens,
-                generation_kwargs=config.generation_kwargs,
-            )
-            if "answer" in config.capture.logits_boundaries or config.capture.streams:
-                decode_ids = (
-                    {row_id: answer_results[row_id]["token_ids"] for row_id, _ in chunk}
-                    if config.capture.every_decode_position
-                    else None
-                )
-                captured = self._capture_resilient(
-                    items=chunk,
-                    boundary="answer",
-                    spec=config.capture,
-                    run_dir=run_dir,
-                    decode_token_ids=decode_ids,
-                )
-                for row_id, paths in captured.items():
-                    capture_paths.setdefault(row_id, {}).update(paths)
-            metric_specs = [
-                config.metrics.resolve(
+        answer_batch_size = config.batch_size_for("answer")
+        capture_batch_size = config.batch_size_for("capture")
+        score_batch_size = config.batch_size_for("score")
+        answer_batch_count = (
+            len(ordered_answer_items) + answer_batch_size - 1
+        ) // answer_batch_size
+        for start in range(0, len(ordered_answer_items), answer_batch_size):
+            chunk = ordered_answer_items[start : start + answer_batch_size]
+            metric_specs_by_id = {
+                row_id: config.metrics.resolve(
                     x=int(pending_by_id[row_id]["x"]),
                     y=int(pending_by_id[row_id]["y"]),
                 )
                 for row_id, _ in chunk
-            ]
-            score_records = self._score_resilient(
-                [prompt for _, prompt in chunk], metric_specs
+            }
+            capture_surface_logits_from_generation = (
+                "answer" in config.capture.logits_boundaries
+                and config.capture.logits_scope == "answer_surfaces"
+                and not config.capture.every_decode_position
+                and config.capture.logit_tokens == "last"
             )
-            scores_by_id = {row_id: record for (row_id, _), record in zip(chunk, score_records)}
+            answer_results = self._generate_resilient(
+                chunk,
+                max_new_tokens=config.max_answer_tokens,
+                generation_kwargs=config.generation_kwargs,
+                capture_first_token_logits=capture_surface_logits_from_generation,
+            )
+            generation_logit_rows: set[str] = set()
+            if capture_surface_logits_from_generation:
+                for row_id, _ in chunk:
+                    first_token_logits = answer_results[row_id].pop(
+                        "_first_token_logits", None
+                    )
+                    if first_token_logits is None:
+                        continue
+                    generation_logit_rows.add(row_id)
+                    surface_logits = self._surface_raw_logits(
+                        first_token_logits, metric_specs_by_id[row_id]
+                    )
+                    capture_records.setdefault(row_id, {})[
+                        "answer_surface_raw_logits"
+                    ] = surface_logits
+            if "answer" in config.capture.logits_boundaries or config.capture.streams:
+                for capture_start in range(0, len(chunk), capture_batch_size):
+                    capture_items = chunk[
+                        capture_start : capture_start + capture_batch_size
+                    ]
+                    capture_row_ids = {row_id for row_id, _ in capture_items}
+                    capture_logits = not (
+                        "answer" in config.capture.logits_boundaries
+                        and capture_row_ids <= generation_logit_rows
+                    )
+                    if not config.capture.streams and not capture_logits:
+                        continue
+                    decode_ids = (
+                        {
+                            row_id: answer_results[row_id]["token_ids"]
+                            for row_id, _ in capture_items
+                        }
+                        if config.capture.every_decode_position
+                        else None
+                    )
+                    captured = self._capture_resilient(
+                        items=capture_items,
+                        boundary="answer",
+                        spec=config.capture,
+                        run_dir=run_dir,
+                        decode_token_ids=decode_ids,
+                        metric_specs=metric_specs_by_id,
+                        capture_logits=capture_logits,
+                    )
+                    for row_id, paths in captured.items():
+                        capture_records.setdefault(row_id, {}).update(paths)
+            scores_by_id: dict[str, dict[str, object]] = {}
+            for score_start in range(0, len(chunk), score_batch_size):
+                score_items = chunk[score_start : score_start + score_batch_size]
+                score_specs = [
+                    metric_specs_by_id[row_id] for row_id, _ in score_items
+                ]
+                score_records = self._score_resilient(
+                    [prompt for _, prompt in score_items], score_specs
+                )
+                scores_by_id.update(
+                    {
+                        row_id: record
+                        for (row_id, _), record in zip(score_items, score_records)
+                    }
+                )
             for row_id, prompt in chunk:
                 source = pending_by_id[row_id]
                 answer = answer_results[row_id]
@@ -1051,7 +1227,7 @@ class QwenRunner:
                     "candidate_1_sequence_log_probability": candidate_1_sequence_score,
                     "candidate_2_sequence_log_probability": candidate_2_sequence_score,
                     "candidate_1_minus_candidate_2_logit": canonical_logit_difference,
-                    **capture_paths.get(row_id, {}),
+                    **capture_records.get(row_id, {}),
                     "generation_settings": {
                         "do_sample": False,
                         "enable_thinking": False,
@@ -1061,13 +1237,22 @@ class QwenRunner:
                     },
                 }
                 completed[row_id] = record
-            ordered = [
-                completed[str(row["row_id"])] for row in dataset if row["row_id"] in completed
-            ]
-            _atomic_write_text(
-                results_path,
-                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in ordered),
-            )
+            answer_batch_index = start // answer_batch_size + 1
+            if (
+                answer_batch_index % config.checkpoint_every_batches == 0
+                or answer_batch_index == answer_batch_count
+            ):
+                ordered = [
+                    completed[str(row["row_id"])]
+                    for row in dataset
+                    if row["row_id"] in completed
+                ]
+                _atomic_write_text(
+                    results_path,
+                    "".join(
+                        json.dumps(row, ensure_ascii=False) + "\n" for row in ordered
+                    ),
+                )
 
         ordered_results = [
             completed[str(row["row_id"])] for row in dataset if row["row_id"] in completed

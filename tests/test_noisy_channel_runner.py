@@ -6,10 +6,12 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
+import mats_experiments.noisy_channel_bayesian.runner as runner_module
 from mats_experiments.noisy_channel_bayesian import (
     CaptureSpec,
     ExecutionConfig,
     FixedSubsetQuestion,
+    MetricSpec,
     NoisyChannelBayesianEnvironment,
     QwenRunner,
     TokenizerBinding,
@@ -102,6 +104,43 @@ class FakeModel(nn.Module):
             raise RuntimeError("CUDA out of memory")
         suffix = torch.tensor([[ord("1") + 3, 2]] * len(input_ids))
         return torch.cat([input_ids, suffix], dim=1)
+
+
+class GenerateLogitsFakeModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, input_ids, attention_mask, use_cache=False):
+        self.forward_calls += 1
+        return super().forward(input_ids, attention_mask, use_cache)
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens
+        self.generate_calls += 1
+        suffix = torch.tensor([[ord("1") + 3, 2]] * len(input_ids))
+        sequences = torch.cat([input_ids, suffix], dim=1)
+        if not kwargs.get("output_logits"):
+            return sequences
+        logits = torch.zeros(len(input_ids), 300)
+        logits[:, ord("1") + 3] = 3
+        logits[:, ord("2") + 3] = 1
+        return SimpleNamespace(sequences=sequences, logits=(logits,))
+
+
+class FinalLogitOnlyFakeModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.logits_to_keep_calls = []
+
+    def forward(
+        self, input_ids, attention_mask, use_cache=False, logits_to_keep=0
+    ):
+        self.logits_to_keep_calls.append(logits_to_keep)
+        output = super().forward(input_ids, attention_mask, use_cache)
+        if logits_to_keep:
+            output.logits = output.logits[:, -logits_to_keep:, :]
+        return output
 
 
 def make_dataset(tmp_path: Path, *, reasoning_budget=3):
@@ -278,6 +317,98 @@ def test_oom_recursively_splits_batches(tmp_path: Path) -> None:
     assert sorted(results.manifest["effective_batch_sizes"]) == [1, 1]
 
 
+def test_answer_surface_logits_reuse_generation_without_capture_forward(
+    tmp_path: Path,
+) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    model = GenerateLogitsFakeModel()
+    results = QwenRunner(
+        model=model, tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="surface_logits",
+            batch_size=2,
+            capture=CaptureSpec(
+                logits_boundaries=("answer",),
+                logits_scope="answer_surfaces",
+            ),
+            metrics=MetricSpec(sequence_scores=False),
+        ),
+    )
+
+    assert model.generate_calls == 1
+    assert model.forward_calls == 0
+    assert all("logit_path" not in row for row in results)
+    for row in results:
+        assert row["answer_surface_raw_logits"] == {"1": 3.0, "2": 1.0}
+        assert get_answer_surface_logits(row, tmp_path / "runs/surface_logits") == {
+            "1": 3.0,
+            "2": 1.0,
+        }
+
+
+def test_boundary_capture_projects_only_final_prompt_position(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    model = FinalLogitOnlyFakeModel()
+    results = QwenRunner(
+        model=model, tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="final_logits",
+            batch_size=2,
+            capture=CaptureSpec(logits_boundaries=("answer",)),
+            metrics=MetricSpec(sequence_scores=False),
+        ),
+    )
+
+    assert model.logits_to_keep_calls == [1]
+    logits = load_file(
+        tmp_path / "runs/final_logits/logits" / f"{results[0]['row_id']}.safetensors"
+    )
+    assert logits["answer.logits"].shape == (300,)
+
+
+def test_results_checkpoint_is_periodic_not_per_minibatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(n=2, k=3, r_values="3/4"),
+        FixedSubsetQuestion([[1], [2], [1]]),
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    dataset.save(tmp_path)
+    results_writes = []
+    original_write = runner_module._atomic_write_text
+
+    def track_write(path, text):
+        if Path(path).name == "results.jsonl":
+            results_writes.append(len(text))
+        return original_write(path, text)
+
+    monkeypatch.setattr(runner_module, "_atomic_write_text", track_write)
+    results = QwenRunner(
+        model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="periodic_checkpoint",
+            batch_size=2,
+            checkpoint_every_batches=3,
+            metrics=MetricSpec(sequence_scores=False),
+        ),
+    )
+
+    assert len(results) == 8
+    assert len(results_writes) == 2
+
+
 def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
     dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
     runner = QwenRunner(model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu"))
@@ -289,8 +420,8 @@ def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
             batch_size=2,
             capture=CaptureSpec(
                 logits_boundaries=("answer",),
-                streams=("resid_post",),
-                layers=(-1,),
+                streams=("resid_pre", "token_mixer_out", "mlp_out", "resid_post"),
+                layers="all",
                 every_decode_position=True,
             ),
         ),
@@ -300,7 +431,9 @@ def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
     activations = load_file(
         tmp_path / "runs/decode/activations" / f"{results[0]['row_id']}.safetensors"
     )
-    assert activations["answer.resid_post.layer_1"].shape == (1, 4)
+    for stream in ("resid_pre", "token_mixer_out", "mlp_out", "resid_post"):
+        for layer in range(2):
+            assert activations[f"answer.{stream}.layer_{layer}"].shape == (1, 4)
 
 
 def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> None:
@@ -317,6 +450,7 @@ def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> Non
                 streams=("resid_pre", "token_mixer_out", "mlp_out", "resid_post"),
                 layers="all",
                 tokens="all",
+                logit_tokens="all",
                 every_decode_position=False,
             ),
         ),
@@ -336,7 +470,10 @@ def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> Non
         logits = load_file(
             tmp_path / "runs/all_prompt_tokens/logits" / f"{row['row_id']}.safetensors"
         )
-        assert logits["answer.logits"].shape == (300,)
+        assert logits["answer.logits"].shape == (
+            len(row["answer_input_ids"]),
+            300,
+        )
 
 
 class ConstructionOnlyTokenizer(FakeTokenizer):

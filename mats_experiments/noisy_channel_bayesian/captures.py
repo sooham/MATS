@@ -102,6 +102,19 @@ def get_answer_surface_logits(
     token_ids = result_row.get("answer_surface_token_ids")
     if not isinstance(surfaces, Mapping) or not isinstance(token_ids, Mapping):
         raise TypeError("Result row does not contain resolved answer surfaces and token IDs.")
+    inline = result_row.get(f"{boundary}_surface_raw_logits")
+    if isinstance(inline, Mapping):
+        selected_inline: dict[str, float] = {}
+        for internal_label in ("X", "Y"):
+            surface = surfaces.get(internal_label)
+            if not isinstance(surface, str) or surface not in inline:
+                raise TypeError(f"Malformed inline logit metadata for {internal_label}.")
+            value = inline[surface]
+            if isinstance(value, (list, tuple)):
+                value = value[position]
+            selected_inline[surface] = float(value)
+        return selected_inline
+
     logits = get_logits(result_row, run_dir, boundary=boundary)
     if logits.ndim > 1:
         logits = logits[position]
