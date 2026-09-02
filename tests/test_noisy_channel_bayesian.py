@@ -10,6 +10,7 @@ from mats_experiments.noisy_channel_bayesian import (
     CandidateEvidenceDatasetGenerator,
     CandidateEvidenceQuestion,
     FixedSubsetQuestion,
+    MetricSpec,
     NoisyChannelBayesianEnvironment,
     RandomSubsetQuestion,
     SystemPrompt,
@@ -22,6 +23,7 @@ from mats_experiments.noisy_channel_bayesian import (
     exact_pattern_mass,
     resolve_selector,
     stage_two_messages,
+    strip_thinking_markers,
     summarize_representation_control,
 )
 
@@ -161,6 +163,8 @@ def test_fixed_and_random_subset_validation_and_replacement() -> None:
 
 def test_multistage_layouts_word_cap_and_ties() -> None:
     assert enforce_reasoning("one two three ANSWER: X", 2) == "one two"
+    assert strip_thinking_markers("\n<think>\none two\n</think>\n") == "one two"
+    assert enforce_reasoning("<think>one two three</think>", 2) == "one two"
     base = [{"role": "user", "content": "REASONING:"}]
     conversation = stage_two_messages(
         first_messages=base, enforced_reasoning="work", layout="conversation"
@@ -179,6 +183,22 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
     ).generate(num_question_sets=1)
     assert all(row["normative_comparison"] == "SAME" for row in tied)
     assert all(row["ground_truth_choice"] is None for row in tied)
+
+
+@pytest.mark.parametrize("reasoning_budget", [0, 12])
+def test_probe_values_are_the_model_facing_answer_surfaces(reasoning_budget: int) -> None:
+    dataset = generator(
+        environment=NoisyChannelBayesianEnvironment(n=8, k=1, r_values="3/4"),
+        question=FixedSubsetQuestion([[2, 4, 7]]),
+        probe=XVsYPosteriorProbe(x=2, y=7, reasoning_budget=reasoning_budget),
+    ).generate(num_question_sets=1)
+    prompt = dataset[0]["messages"][-1]["content"]
+    assert "Reply with exactly 2 or 7." in prompt
+    assert "where X means" not in prompt
+    assert prompt.endswith("REASONING:" if reasoning_budget else "ANSWER:")
+
+    resolved = MetricSpec().resolve(x=2, y=7)
+    assert resolved.surfaces == {"X": "2", "Y": "7", "SAME": "SAME"}
 
 
 def test_candidate_evidence_projection_is_exact_paired_and_set_free(
@@ -206,15 +226,16 @@ def test_candidate_evidence_projection_is_exact_paired_and_set_free(
     assert len(reduced) == len(raw) == 4
     assert [row["source_row_id"] for row in reduced] == [row["row_id"] for row in raw]
     row = reduced[1]  # reports YES, NO
+    assert set(row["candidate_evidence"]) == {"2", "7"}
     assert [
-        observation["relation"] for observation in row["candidate_evidence"]["X"]["observations"]
+        observation["relation"] for observation in row["candidate_evidence"]["2"]["observations"]
     ] == ["AGREES", "DISAGREES"]
     assert [
-        observation["relation"] for observation in row["candidate_evidence"]["Y"]["observations"]
+        observation["relation"] for observation in row["candidate_evidence"]["7"]["observations"]
     ] == ["DISAGREES", "DISAGREES"]
     assert [
         observation["reliability_surface"]
-        for observation in row["candidate_evidence"]["X"]["observations"]
+        for observation in row["candidate_evidence"]["2"]["observations"]
     ] == ["0.95", "0.6"]
     assert row["posterior_exact"] == raw[1]["posterior_exact"]
     assert row["x_posterior_exact"] == raw[1]["x_posterior_exact"]
@@ -223,7 +244,10 @@ def test_candidate_evidence_projection_is_exact_paired_and_set_free(
     assert row["audit_metadata"]["membership_sets"] == [[2, 4], [2, 7]]
     assert row["audit_metadata"]["observed_reports"] == ["YES", "NO"]
     prompt = row["messages"][-1]["content"]
-    assert "Candidate X (s=2):" in prompt
+    assert "Candidate s=2:" in prompt
+    assert "Candidate s=7:" in prompt
+    assert "Reply with exactly 2 or 7." in prompt
+    assert "Candidate X" not in prompt
     assert "Observation 1: AGREES; reliability 0.95." in prompt
     assert "Is s in" not in prompt
     assert "Observed report:" not in prompt

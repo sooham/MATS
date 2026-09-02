@@ -11,6 +11,7 @@ import hashlib
 import itertools
 import json
 import random
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -307,7 +308,7 @@ def derive_candidate_evidence(
     if not (len(membership_sets) == len(reports) == len(reliabilities)):
         raise ValueError("Questions, reports, and reliabilities must have equal lengths.")
     evidence: dict[str, dict[str, object]] = {}
-    for label, candidate in (("X", probe.x), ("Y", probe.y)):
+    for candidate in (probe.x, probe.y):
         observations: list[dict[str, object]] = []
         for index, (membership, report, reliability) in enumerate(
             zip(membership_sets, reports, reliabilities), start=1
@@ -328,8 +329,7 @@ def derive_candidate_evidence(
                     "reliability_surface": reliability_surface(reliability),
                 }
             )
-        evidence[label] = {
-            "candidate_label": label,
+        evidence[str(candidate)] = {
             "candidate_value": candidate,
             "observations": observations,
         }
@@ -348,8 +348,7 @@ def render_candidate_evidence_prompt(
     lines = [
         f"A value s is uniformly distributed over the integers 1 through {n}.",
         (
-            f"Candidate X means s={probe.x} and candidate Y means s={probe.y}, so the "
-            "candidates have equal prior probability."
+            f"The candidates s={probe.x} and s={probe.y} have equal prior probability."
         ),
         "",
         (
@@ -361,11 +360,13 @@ def render_candidate_evidence_prompt(
         ),
         "",
     ]
-    for label in ("X", "Y"):
-        evidence = candidate_evidence[label]
-        if int(evidence["candidate_value"]) != getattr(probe, label.lower()):
-            raise ValueError(f"Candidate evidence for {label} has the wrong candidate value.")
-        lines.append(f"Candidate {label} (s={evidence['candidate_value']}):")
+    for candidate in (probe.x, probe.y):
+        evidence = candidate_evidence[str(candidate)]
+        if int(evidence["candidate_value"]) != candidate:
+            raise ValueError(
+                f"Candidate evidence for s={candidate} has the wrong candidate value."
+            )
+        lines.append(f"Candidate s={evidence['candidate_value']}:")
         observations = evidence["observations"]
         if not isinstance(observations, Sequence):
             raise TypeError("candidate observations must be a sequence.")
@@ -378,7 +379,7 @@ def render_candidate_evidence_prompt(
                 f"{raw_observation['reliability_surface']}."
             )
         lines.append("")
-    choices = "X or Y" + (" or SAME" if probe.allow_same else "")
+    choices = f"{probe.x} or {probe.y}" + (" or SAME" if probe.allow_same else "")
     lines.extend(
         [
             "Which candidate has greater posterior probability after all observations?",
@@ -435,8 +436,8 @@ def render_observable_prompt(
             ),
         ]
     )
-    choices = "X or Y" + (" or SAME" if probe.allow_same else "")
-    lines.append(f"Reply with exactly {choices}, where X means {probe.x} and Y means {probe.y}.")
+    choices = f"{probe.x} or {probe.y}" + (" or SAME" if probe.allow_same else "")
+    lines.append(f"Reply with exactly {choices}.")
     lines.append("REASONING:" if stage == "reasoning" else "ANSWER:")
     return "\n".join(lines)
 
@@ -451,11 +452,18 @@ def initial_messages(
     return messages
 
 
+def strip_thinking_markers(text: str) -> str:
+    """Remove Qwen-native think delimiters from a visible reasoning completion."""
+
+    return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+
+
 def enforce_reasoning(text: str, budget: int) -> str:
     """Remove a generated answer tail and enforce a whitespace-delimited word cap."""
 
     if budget <= 0:
         return ""
+    text = strip_thinking_markers(text)
     # A model may anticipate the next stage.  Anything from that marker onward is discarded.
     upper = text.upper()
     marker = upper.find("ANSWER:")
@@ -511,13 +519,31 @@ class CaptureSpec:
 
 @dataclass(frozen=True)
 class MetricSpec:
-    x_surface: str = "X"
-    y_surface: str = "Y"
+    """Answer scoring surfaces; omitted X/Y surfaces resolve from each row's probe."""
+
+    x_surface: str | None = None
+    y_surface: str | None = None
     same_surface: str = "SAME"
     sequence_scores: bool = True
 
+    def resolve(self, *, x: int, y: int) -> MetricSpec:
+        resolved = MetricSpec(
+            x_surface=str(x) if self.x_surface is None else self.x_surface,
+            y_surface=str(y) if self.y_surface is None else self.y_surface,
+            same_surface=self.same_surface,
+            sequence_scores=self.sequence_scores,
+        )
+        surfaces = list(resolved.surfaces.values())
+        if any(not surface for surface in surfaces):
+            raise ValueError("Metric answer surfaces must not be empty.")
+        if len({surface.casefold() for surface in surfaces}) != len(surfaces):
+            raise ValueError("Metric answer surfaces must be distinct (ignoring case).")
+        return resolved
+
     @property
     def surfaces(self) -> dict[str, str]:
+        if self.x_surface is None or self.y_surface is None:
+            raise ValueError("Resolve MetricSpec with probe x and y before reading surfaces.")
         return {"X": self.x_surface, "Y": self.y_surface, "SAME": self.same_surface}
 
 
@@ -653,6 +679,8 @@ def build_candidate_evidence_row(
         question=question,
     )
     messages = initial_messages(observable_prompt=observable, system_prompt=system_prompt)
+    serialized_prompt = tokenizer_binding.serialize(messages)
+    input_ids = tokenizer_binding.input_ids(messages)
     source_row_id = str(source_row["row_id"])
     identity = {
         "schema_version": SCHEMA_VERSION,
@@ -672,6 +700,9 @@ def build_candidate_evidence_row(
             "call_layout": probe.call_layout,
         },
         "system_prompt": system_prompt.content,
+        "messages": messages,
+        "serialized_prompt": serialized_prompt,
+        "input_ids": input_ids,
         "tokenizer_template_fingerprint": tokenizer_binding.fingerprint,
     }
     row: dict[str, object] = {
@@ -702,8 +733,8 @@ def build_candidate_evidence_row(
             "observed_reports": reports,
         },
         "messages": messages,
-        "serialized_prompt": tokenizer_binding.serialize(messages),
-        "input_ids": tokenizer_binding.input_ids(messages),
+        "serialized_prompt": serialized_prompt,
+        "input_ids": input_ids,
         "tokenizer_template_fingerprint": tokenizer_binding.fingerprint,
         "prior_predictive_exact": fraction_text(evidence_mass),
         "prior_predictive": float(evidence_mass),
@@ -741,6 +772,8 @@ def build_row(
         stage=stage,
     )
     messages = initial_messages(observable_prompt=observable, system_prompt=system_prompt)
+    serialized_prompt = tokenizer_binding.serialize(messages)
+    input_ids = tokenizer_binding.input_ids(messages)
     pattern_surface = "".join("Y" if report == YES else "N" for report in reports)
     identity = {
         "schema_version": SCHEMA_VERSION,
@@ -756,6 +789,9 @@ def build_row(
         "reasoning_budget": probe.reasoning_budget,
         "call_layout": probe.call_layout,
         "system_prompt": system_prompt.content,
+        "messages": messages,
+        "serialized_prompt": serialized_prompt,
+        "input_ids": input_ids,
         "tokenizer_template_fingerprint": tokenizer_binding.fingerprint,
     }
     row: dict[str, object] = {
@@ -779,8 +815,8 @@ def build_row(
         "reasoning_budget": probe.reasoning_budget,
         "call_layout": probe.call_layout,
         "messages": messages,
-        "serialized_prompt": tokenizer_binding.serialize(messages),
-        "input_ids": tokenizer_binding.input_ids(messages),
+        "serialized_prompt": serialized_prompt,
+        "input_ids": input_ids,
         "tokenizer_template_fingerprint": tokenizer_binding.fingerprint,
         "prior_predictive_exact": fraction_text(evidence),
         "prior_predictive": float(evidence),

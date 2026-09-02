@@ -15,6 +15,9 @@ from mats_experiments.noisy_channel_bayesian import (
     TokenizerBinding,
     TranscriptDatasetGenerator,
     XVsYPosteriorProbe,
+    get_activation,
+    get_answer_surface_logits,
+    parse_model_choice,
     select_unpadded_tokens,
 )
 
@@ -88,8 +91,8 @@ class FakeModel(nn.Module):
         for layer in self.layers:
             hidden = layer(hidden)
         logits = torch.zeros(*input_ids.shape, 300)
-        logits[..., ord("X") + 3] = 3
-        logits[..., ord("Y") + 3] = 1
+        logits[..., ord("1") + 3] = 3
+        logits[..., ord("2") + 3] = 1
         return SimpleNamespace(logits=logits)
 
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
@@ -97,7 +100,7 @@ class FakeModel(nn.Module):
         self.generate_calls += 1
         if self.oom_batches and len(input_ids) > 1:
             raise RuntimeError("CUDA out of memory")
-        suffix = torch.tensor([[ord("X") + 3, 2]] * len(input_ids))
+        suffix = torch.tensor([[ord("1") + 3, 2]] * len(input_ids))
         return torch.cat([input_ids, suffix], dim=1)
 
 
@@ -141,13 +144,38 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
     assert len(results) == 2
     assert model.generate_calls == 2
     assert all(row["model_choice"] == "X" for row in results)
+    assert all(row["model_choice_surface"] == "1" for row in results)
+    assert all(row["answer_surfaces"]["X"] == "1" for row in results)
+    assert all(row["answer_surfaces"]["Y"] == "2" for row in results)
+    assert all(row["answer_surface_token_ids"]["X"] == [ord("1") + 3] for row in results)
+    assert all(set(row["sequence_log_probabilities"]) == {"1", "2", "SAME"} for row in results)
+    assert all(
+        row["sequence_log_probabilities"]["1"]
+        == row["x_sequence_log_probability"]
+        for row in results
+    )
     assert all(row["x_minus_y_logit"] == pytest.approx(2) for row in results)
     assert all(len(row["enforced_reasoning"].split()) <= 3 for row in results)
+    assert all(row["reasoning_serialized_prompt"] for row in results)
+    assert all(row["reasoning_input_ids"] for row in results)
+    assert all(row["reasoning_input_tokens"] for row in results)
+    assert all(row["answer_input_ids"] == tokenizer.encode(row["answer_serialized_prompt"]) for row in results)
     tensors = load_file(tmp_path / "runs/fake/activations" / f"{results[0]['row_id']}.safetensors")
     assert "reasoning.resid_pre.layer_0" in tensors
     assert "answer.resid_post.layer_1" in tensors
     logits = load_file(tmp_path / "runs/fake/logits" / f"{results[0]['row_id']}.safetensors")
     assert logits["answer.logits"].shape == (300,)
+    surface_logits = get_answer_surface_logits(results[0], tmp_path / "runs/fake")
+    assert surface_logits["1"] == pytest.approx(3)
+    assert surface_logits["2"] == pytest.approx(1)
+    assert get_activation(
+        results[0],
+        tmp_path / "runs/fake",
+        boundary="answer",
+        stream="resid_post",
+        layer=1,
+        token_index=-1,
+    ).shape == (4,)
 
     resumed = runner.execute(dataset, config)
     assert len(resumed) == 2
@@ -215,14 +243,94 @@ def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> Non
             tmp_path / "runs/all_prompt_tokens/activations" / f"{row['row_id']}.safetensors"
         )
         assert activations["answer.resid_pre.layer_0"].shape == (
-            len(row["input_ids"]),
+            len(row["answer_input_ids"]),
             4,
         )
         assert activations["answer.token_mixer_out.layer_1"].shape == (
-            len(row["input_ids"]),
+            len(row["answer_input_ids"]),
             4,
         )
         logits = load_file(
             tmp_path / "runs/all_prompt_tokens/logits" / f"{row['row_id']}.safetensors"
         )
         assert logits["answer.logits"].shape == (300,)
+
+
+class ConstructionOnlyTokenizer(FakeTokenizer):
+    chat_template = "construction-only"
+    name_or_path = "construction-only"
+
+    def apply_chat_template(
+        self, messages, *, tokenize, add_generation_prompt, enable_thinking=False
+    ):
+        del enable_thinking
+        text = "".join(f"[{item['role']}]{item['content']}" for item in messages)
+        if add_generation_prompt:
+            text += "[assistant]"
+        return self.encode(text) if tokenize else text
+
+
+def test_runner_reserializes_with_runtime_tokenizer_and_persists_exact_tokens(
+    tmp_path: Path,
+) -> None:
+    construction_tokenizer = ConstructionOnlyTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(n=2, k=1, r_values="3/4"),
+        FixedSubsetQuestion([[1]]),
+        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        TokenizerBinding(construction_tokenizer),
+    ).generate(num_question_sets=1)
+    dataset.save(tmp_path)
+    runtime_tokenizer = FakeTokenizer()
+    result = QwenRunner(
+        model=FakeModel(), tokenizer=runtime_tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="runtime_tokenizer", batch_size=2),
+    )[0]
+
+    assert result["serialized_prompt"].startswith("[system]") is False
+    assert result["serialized_prompt"].startswith("[user]")
+    assert result["answer_serialized_prompt"].startswith("<user>")
+    assert result["answer_serialized_prompt"] != result["serialized_prompt"]
+    assert result["answer_input_ids"] == runtime_tokenizer.encode(
+        result["answer_serialized_prompt"]
+    )
+    assert "Reply with exactly 1 or 2." in result["answer_serialized_prompt"]
+    assert result["runtime_tokenizer_template_fingerprint"] != result[
+        "tokenizer_template_fingerprint"
+    ]
+
+
+def test_numeric_choice_parser_uses_whole_surfaces() -> None:
+    assert parse_model_choice("Final answer: 2", allow_same=False, x_surface="2", y_surface="7") == "X"
+    assert parse_model_choice("Final answer: 7", allow_same=False, x_surface="2", y_surface="7") == "Y"
+    assert parse_model_choice("Final answer: 27", allow_same=False, x_surface="2", y_surface="7") is None
+
+
+class ThinkingMarkerFakeModel(FakeModel):
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens, kwargs
+        self.generate_calls += 1
+        text = "<think>visible reasoning</think>" if self.generate_calls == 1 else "1"
+        suffix = torch.tensor([self._encode(text) + [2]] * len(input_ids))
+        return torch.cat([input_ids, suffix], dim=1)
+
+    @staticmethod
+    def _encode(text):
+        return [ord(character) + 3 for character in text]
+
+
+def test_reasoning_completion_removes_stray_native_thinking_markers(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=3)
+    result = QwenRunner(
+        model=ThinkingMarkerFakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="thinking_markers", batch_size=2),
+    )[0]
+    assert result["reasoning_completion"]["text"] == "visible reasoning"
+    assert result["reasoning_completion"]["raw_text"] == "<think>visible reasoning</think>"
+    assert result["reasoning_completion"]["thinking_markers_removed"] is True
+    assert "<think>" not in result["enforced_reasoning"]
+    assert result["generation_settings"]["enable_thinking"] is False

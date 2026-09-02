@@ -12,7 +12,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .core import CaptureSpec, MetricSpec, enforce_reasoning, stage_two_messages
+from .core import (
+    CaptureSpec,
+    MetricSpec,
+    TokenizerBinding,
+    enforce_reasoning,
+    stage_two_messages,
+    strip_thinking_markers,
+)
 from .dataset import TranscriptDataset, _atomic_write_text
 
 
@@ -94,11 +101,26 @@ def select_unpadded_tokens(tensor: Any, attention_mask: Any, selector: object) -
     return rows
 
 
-def parse_model_choice(text: str, *, allow_same: bool) -> str | None:
-    choices = re.findall(r"(?<![A-Z])(SAME|X|Y)(?![A-Z])", text.upper())
-    if not choices:
+def parse_model_choice(
+    text: str,
+    *,
+    allow_same: bool,
+    x_surface: str = "X",
+    y_surface: str = "Y",
+    same_surface: str = "SAME",
+) -> str | None:
+    """Parse model-facing surfaces and return the internal X/Y/SAME label."""
+
+    surfaces = {"X": x_surface, "Y": y_surface, "SAME": same_surface}
+    reverse = {surface.casefold(): choice for choice, surface in surfaces.items()}
+    if len(reverse) != len(surfaces):
+        raise ValueError("Choice surfaces must be distinct (ignoring case).")
+    alternatives = sorted(surfaces.values(), key=len, reverse=True)
+    pattern = r"(?<!\w)(" + "|".join(re.escape(value) for value in alternatives) + r")(?!\w)"
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+    if not matches:
         return None
-    choice = choices[-1]
+    choice = reverse[matches[-1].casefold()]
     return choice if choice != "SAME" or allow_same else None
 
 
@@ -302,10 +324,13 @@ class QwenRunner:
             "enable_thinking": False,
         }
         try:
-            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+            rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
         except TypeError:
             kwargs.pop("enable_thinking")
-            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+            rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        if not isinstance(rendered, str):
+            raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
+        return rendered
 
     def _encode_prompts(self, prompts: Sequence[str]) -> dict[str, Any]:
         import torch
@@ -448,21 +473,50 @@ class QwenRunner:
             ids = ids[0]
         return [int(value) for value in ids]
 
+    def _prompt_token_record(self, prompt: str) -> dict[str, object]:
+        """Return the exact, unpadded runtime-tokenizer representation of a prompt."""
+
+        input_ids = self._surface_ids(prompt)
+        convert = getattr(self.tokenizer, "convert_ids_to_tokens", None)
+        if callable(convert):
+            raw_tokens = convert(input_ids)
+            tokens = [str(token) for token in raw_tokens]
+        else:
+            tokens = []
+            for token_id in input_ids:
+                try:
+                    token = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                except TypeError:
+                    token = self.tokenizer.decode([token_id])
+                tokens.append(str(token))
+        return {"input_ids": input_ids, "tokens": tokens}
+
     def _score_batch(
-        self, prompts: Sequence[str], metric_spec: MetricSpec
+        self, prompts: Sequence[str], metric_specs: Sequence[MetricSpec]
     ) -> list[dict[str, object]]:
         """Batched teacher-forced scores for potentially multi-token answer surfaces."""
 
         import torch
 
-        surface_ids = {
-            choice: self._surface_ids(surface) for choice, surface in metric_spec.surfaces.items()
-        }
-        records = [{"sequence_log_probabilities": {}} for _ in prompts]
+        if len(prompts) != len(metric_specs):
+            raise ValueError("Every scoring prompt must have one resolved MetricSpec.")
+        surface_ids_by_row = [
+            {choice: self._surface_ids(surface) for choice, surface in spec.surfaces.items()}
+            for spec in metric_specs
+        ]
+        records = [
+            {
+                "answer_surfaces": spec.surfaces,
+                "answer_surface_token_ids": surface_ids,
+                "sequence_log_probabilities": {},
+            }
+            for spec, surface_ids in zip(metric_specs, surface_ids_by_row)
+        ]
+        label_scores_by_row: list[dict[str, float]] = [{} for _ in prompts]
         jobs: list[tuple[int, str, list[int], list[int]]] = []
         for row_index, prompt in enumerate(prompts):
             prompt_ids = self._surface_ids(prompt)
-            for choice, continuation in surface_ids.items():
+            for choice, continuation in surface_ids_by_row[row_index].items():
                 if continuation:
                     jobs.append((row_index, choice, prompt_ids, continuation))
         if not jobs:
@@ -489,9 +543,16 @@ class QwenRunner:
             positions = torch.arange(offset, offset + len(answer), device=self.device)
             targets = torch.tensor(answer, dtype=torch.long, device=self.device)
             score = log_probs[job_index, positions, targets].sum().item()
-            records[row_index]["sequence_log_probabilities"][choice] = float(score)  # type: ignore[index]
-        for record in records:
-            scores = record["sequence_log_probabilities"]
+            label_scores_by_row[row_index][choice] = float(score)
+        for record, surface_ids, spec, scores in zip(
+            records, surface_ids_by_row, metric_specs, label_scores_by_row
+        ):
+            record["sequence_log_probabilities"] = {
+                spec.surfaces[label]: score for label, score in scores.items()
+            }
+            record["x_sequence_log_probability"] = scores["X"]
+            record["y_sequence_log_probability"] = scores["Y"]
+            record["same_sequence_log_probability"] = scores["SAME"]
             x_ids, y_ids = surface_ids["X"], surface_ids["Y"]
             if len(x_ids) == len(y_ids) == 1:
                 # Difference of one-token log probabilities equals the raw-logit difference.
@@ -501,14 +562,32 @@ class QwenRunner:
         return records
 
     def _score_resilient(
-        self, prompts: Sequence[str], metric_spec: MetricSpec
+        self, prompts: Sequence[str], metric_specs: Sequence[MetricSpec]
     ) -> list[dict[str, object]]:
         if not prompts:
             return []
-        if not metric_spec.sequence_scores:
-            return [{"sequence_log_probabilities": None, "x_minus_y_logit": None} for _ in prompts]
+        if len(prompts) != len(metric_specs):
+            raise ValueError("Every scoring prompt must have one resolved MetricSpec.")
+        if not all(spec.sequence_scores for spec in metric_specs):
+            if any(spec.sequence_scores for spec in metric_specs):
+                raise ValueError("A scoring minibatch cannot mix enabled and disabled metrics.")
+            return [
+                {
+                    "answer_surfaces": spec.surfaces,
+                    "answer_surface_token_ids": {
+                        choice: self._surface_ids(surface)
+                        for choice, surface in spec.surfaces.items()
+                    },
+                    "sequence_log_probabilities": None,
+                    "x_sequence_log_probability": None,
+                    "y_sequence_log_probability": None,
+                    "same_sequence_log_probability": None,
+                    "x_minus_y_logit": None,
+                }
+                for spec in metric_specs
+            ]
         try:
-            records = self._score_batch(prompts, metric_spec)
+            records = self._score_batch(prompts, metric_specs)
             self._effective_score_batch_sizes.append(len(prompts))
             return records
         except RuntimeError as error:
@@ -521,8 +600,8 @@ class QwenRunner:
                 torch.cuda.empty_cache()
             midpoint = len(prompts) // 2
             return [
-                *self._score_resilient(prompts[:midpoint], metric_spec),
-                *self._score_resilient(prompts[midpoint:], metric_spec),
+                *self._score_resilient(prompts[:midpoint], metric_specs[:midpoint]),
+                *self._score_resilient(prompts[midpoint:], metric_specs[midpoint:]),
             ]
 
     def _capture_batch(
@@ -678,6 +757,7 @@ class QwenRunner:
 
     def execute(self, dataset: TranscriptDataset, config: ExecutionConfig) -> TranscriptDataset:
         self._ensure_loaded()
+        runtime_tokenizer_fingerprint = TokenizerBinding(self.tokenizer).fingerprint
         root = Path(config.experiment_dir) if config.experiment_dir else dataset.experiment_dir
         if root is None:
             raise ValueError("Set ExecutionConfig.experiment_dir or save the dataset first.")
@@ -698,14 +778,25 @@ class QwenRunner:
 
         reasoning_rows = [row for row in pending if int(row["reasoning_budget"]) > 0]
         reasoning_items = [
-            (str(row["row_id"]), str(row["serialized_prompt"])) for row in reasoning_rows
+            (str(row["row_id"]), self._serialize(row["messages"]))  # type: ignore[arg-type]
+            for row in reasoning_rows
         ]
+        reasoning_prompts_by_id = dict(reasoning_items)
+        reasoning_prompt_records = {
+            row_id: self._prompt_token_record(prompt) for row_id, prompt in reasoning_items
+        }
         reasoning_results = self._run_bucketed(
             reasoning_items,
             batch_size=config.batch_size,
             max_new_tokens=config.max_reasoning_tokens,
             generation_kwargs=config.generation_kwargs,
         )
+        for completion in reasoning_results.values():
+            raw_text = str(completion["text"])
+            cleaned_text = strip_thinking_markers(raw_text)
+            completion["raw_text"] = raw_text
+            completion["text"] = cleaned_text
+            completion["thinking_markers_removed"] = cleaned_text != raw_text.strip()
         capture_paths: dict[str, dict[str, str]] = {}
         if "reasoning" in config.capture.logits_boundaries or config.capture.streams:
             for start in range(0, len(reasoning_items), config.batch_size):
@@ -745,9 +836,12 @@ class QwenRunner:
                 prompt = self._serialize(messages)
             else:
                 messages = [dict(message) for message in row["messages"]]  # type: ignore[union-attr]
-                prompt = str(row["serialized_prompt"])
+                prompt = self._serialize(messages)
             answer_messages[row_id] = messages
             answer_items.append((row_id, prompt))
+        answer_prompt_records = {
+            row_id: self._prompt_token_record(prompt) for row_id, prompt in answer_items
+        }
         pending_by_id = {str(row["row_id"]): row for row in pending}
         ordered_answer_items = sorted(answer_items, key=lambda item: len(item[1]))
         # A finalized result checkpoint is written after each successful answer minibatch.
@@ -773,32 +867,65 @@ class QwenRunner:
                 )
                 for row_id, paths in captured.items():
                     capture_paths.setdefault(row_id, {}).update(paths)
-            score_records = self._score_resilient([prompt for _, prompt in chunk], config.metrics)
+            metric_specs = [
+                config.metrics.resolve(
+                    x=int(pending_by_id[row_id]["x"]),
+                    y=int(pending_by_id[row_id]["y"]),
+                )
+                for row_id, _ in chunk
+            ]
+            score_records = self._score_resilient(
+                [prompt for _, prompt in chunk], metric_specs
+            )
             scores_by_id = {row_id: record for (row_id, _), record in zip(chunk, score_records)}
             for row_id, prompt in chunk:
                 source = pending_by_id[row_id]
                 answer = answer_results[row_id]
+                score_record = scores_by_id[row_id]
+                answer_surfaces = score_record["answer_surfaces"]
                 choice = parse_model_choice(
-                    str(answer["text"]), allow_same=bool(source["allow_same"])
+                    str(answer["text"]),
+                    allow_same=bool(source["allow_same"]),
+                    x_surface=str(answer_surfaces["X"]),  # type: ignore[index]
+                    y_surface=str(answer_surfaces["Y"]),  # type: ignore[index]
+                    same_surface=str(answer_surfaces["SAME"]),  # type: ignore[index]
                 )
                 ground_truth = source.get("ground_truth_choice")
                 posterior_correct = choice == ground_truth if ground_truth is not None else None
                 reasoning = reasoning_results.get(row_id)
+                reasoning_prompt_record = reasoning_prompt_records.get(row_id)
+                answer_prompt_record = answer_prompt_records[row_id]
                 record = {
                     **source,
                     "answer_messages": answer_messages[row_id],
+                    "reasoning_serialized_prompt": (
+                        reasoning_prompts_by_id[row_id] if reasoning is not None else None
+                    ),
+                    "reasoning_input_ids": (
+                        reasoning_prompt_record["input_ids"] if reasoning_prompt_record else None
+                    ),
+                    "reasoning_input_tokens": (
+                        reasoning_prompt_record["tokens"] if reasoning_prompt_record else None
+                    ),
                     "answer_serialized_prompt": prompt,
-                    "raw_reasoning": reasoning["text"] if reasoning else None,
+                    "answer_input_ids": answer_prompt_record["input_ids"],
+                    "answer_input_tokens": answer_prompt_record["tokens"],
+                    "runtime_tokenizer_template_fingerprint": runtime_tokenizer_fingerprint,
+                    "raw_reasoning": reasoning["raw_text"] if reasoning else None,
                     "enforced_reasoning": enforced_by_id.get(row_id),
                     "reasoning_completion": reasoning,
                     "answer_completion": answer,
                     "model_choice": choice,
+                    "model_choice_surface": (
+                        answer_surfaces[choice] if choice is not None else None  # type: ignore[index]
+                    ),
                     "parse_compliance": choice is not None,
                     "posterior_correct": posterior_correct,
-                    **scores_by_id[row_id],
+                    **score_record,
                     **capture_paths.get(row_id, {}),
                     "generation_settings": {
                         "do_sample": False,
+                        "enable_thinking": False,
                         "max_answer_tokens": config.max_answer_tokens,
                         "max_reasoning_tokens": config.max_reasoning_tokens,
                         **dict(config.generation_kwargs),
@@ -826,6 +953,7 @@ class QwenRunner:
             "run_id": config.run_id,
             "row_count": len(ordered_results),
             "model": self.model_metadata or asdict(self.model_config),
+            "runtime_tokenizer_template_fingerprint": runtime_tokenizer_fingerprint,
             "execution": {
                 **asdict(config),
                 "experiment_dir": str(root),

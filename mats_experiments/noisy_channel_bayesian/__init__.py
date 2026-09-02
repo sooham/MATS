@@ -1,5 +1,12 @@
 """Exhaustive Bayesian transcript framework for a noisy YES/NO channel."""
 
+from .captures import (
+    get_activation,
+    get_answer_surface_logits,
+    get_logits,
+    load_activation_tensors,
+    load_logit_tensors,
+)
 from .core import (
     CandidateEvidenceBayesianEnvironment,
     CandidateEvidenceQuestion,
@@ -18,6 +25,7 @@ from .core import (
     render_candidate_evidence_prompt,
     render_observable_prompt,
     stage_two_messages,
+    strip_thinking_markers,
 )
 from .dataset import (
     CandidateEvidenceDatasetGenerator,
@@ -57,11 +65,17 @@ __all__ = [
     "enforce_reasoning",
     "exact_bayesian_target",
     "exact_pattern_mass",
+    "get_activation",
+    "get_answer_surface_logits",
+    "get_logits",
+    "load_activation_tensors",
+    "load_logit_tensors",
     "parse_model_choice",
     "render_candidate_evidence_prompt",
     "render_observable_prompt",
     "resolve_selector",
     "select_unpadded_tokens",
     "stage_two_messages",
+    "strip_thinking_markers",
     "summarize_representation_control",
 ]
