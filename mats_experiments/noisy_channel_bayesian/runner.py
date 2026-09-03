@@ -7,7 +7,13 @@ import inspect
 import json
 import os
 import re
+import signal
+import socket
+import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -19,9 +25,6 @@ from .core import (
     CaptureSpec,
     MetricSpec,
     TokenizerBinding,
-    enforce_reasoning,
-    stage_two_messages,
-    strip_thinking_markers,
 )
 from .dataset import TranscriptDataset, _atomic_write_text
 
@@ -39,28 +42,64 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class SGLangMTPConfig:
+    """Native-MTP backend for continuous completion generation."""
+
+    enabled: bool = False
+    python_executable: str | Path = ".venv-sglang/bin/python"
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int = 4
+    context_length: int = 2048
+    mem_fraction_static: float = 0.8
+    cuda_graph_max_batch_size: int = 48
+    attention_backend: str = "triton"
+    sampling_backend: str = "pytorch"
+    mamba_ssm_dtype: str | None = "bfloat16"
+    mamba_full_memory_ratio: float = 4.0
+    startup_timeout_seconds: float = 300.0
+    request_timeout_seconds: float = 3600.0
+
+    def __post_init__(self) -> None:
+        positive_integers = {
+            "speculative_num_steps": self.speculative_num_steps,
+            "speculative_eagle_topk": self.speculative_eagle_topk,
+            "speculative_num_draft_tokens": self.speculative_num_draft_tokens,
+            "context_length": self.context_length,
+            "cuda_graph_max_batch_size": self.cuda_graph_max_batch_size,
+        }
+        invalid = [name for name, value in positive_integers.items() if value < 1]
+        if invalid:
+            raise ValueError(f"SGLang MTP values must be positive: {', '.join(invalid)}.")
+        if not 0 < self.mem_fraction_static < 1:
+            raise ValueError("mem_fraction_static must be strictly between zero and one.")
+        if self.mamba_full_memory_ratio <= 0:
+            raise ValueError("mamba_full_memory_ratio must be positive.")
+        if self.startup_timeout_seconds <= 0 or self.request_timeout_seconds <= 0:
+            raise ValueError("SGLang timeout values must be positive.")
+
+
+@dataclass(frozen=True)
 class ExecutionConfig:
     experiment_dir: str | Path | None = None
     run_id: str = "default"
     batch_size: int = 2
-    reasoning_batch_size: int | None = None
-    answer_batch_size: int | None = None
+    completion_batch_size: int | None = None
     capture_batch_size: int | None = None
     score_batch_size: int | None = None
     checkpoint_every_batches: int = 25
-    max_answer_tokens: int = 8
-    max_reasoning_tokens: int = 256
+    max_completion_tokens: int = 512
     resume: bool = True
     capture: CaptureSpec = field(default_factory=CaptureSpec)
     metrics: MetricSpec = field(default_factory=MetricSpec)
     generation_kwargs: Mapping[str, object] = field(default_factory=dict)
+    completion_mtp: SGLangMTPConfig = field(default_factory=SGLangMTPConfig)
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError("batch_size must be positive.")
         stage_batch_sizes = {
-            "reasoning_batch_size": self.reasoning_batch_size,
-            "answer_batch_size": self.answer_batch_size,
+            "completion_batch_size": self.completion_batch_size,
             "capture_batch_size": self.capture_batch_size,
             "score_batch_size": self.score_batch_size,
         }
@@ -69,15 +108,14 @@ class ExecutionConfig:
             raise ValueError(f"Stage batch sizes must be positive: {', '.join(invalid)}.")
         if self.checkpoint_every_batches < 1:
             raise ValueError("checkpoint_every_batches must be positive.")
-        if self.max_answer_tokens < 1 or self.max_reasoning_tokens < 1:
+        if self.max_completion_tokens < 1:
             raise ValueError("Generation token limits must be positive.")
         if not self.run_id or Path(self.run_id).name != self.run_id:
             raise ValueError("run_id must be one non-empty path component.")
 
     def batch_size_for(self, stage: str) -> int:
         overrides = {
-            "reasoning": self.reasoning_batch_size,
-            "answer": self.answer_batch_size,
+            "completion": self.completion_batch_size,
             "capture": self.capture_batch_size,
             "score": self.score_batch_size,
         }
@@ -169,6 +207,92 @@ def parse_model_choice(
     if not matches:
         return None
     return reverse[matches[-1].casefold()]
+
+
+def parse_completion_contract(
+    text: str,
+    *,
+    reasoning: bool,
+    allow_same: bool,
+    x_surface: str,
+    y_surface: str,
+    same_surface: str = "SAME",
+    answer_prefix: str = "ANSWER:",
+) -> dict[str, object]:
+    """Parse a terminal answer while preserving exact-format diagnostics."""
+
+    enabled = {"X": x_surface, "Y": y_surface}
+    if allow_same:
+        enabled["SAME"] = same_surface
+    alternatives = sorted(enabled.items(), key=lambda item: len(item[1]), reverse=True)
+    value_pattern = "|".join(re.escape(surface) for _, surface in alternatives)
+    marker_positions = [match.start() for match in re.finditer(re.escape(answer_prefix), text)]
+    marker_start = marker_positions[-1] if marker_positions else None
+    marker_end = marker_start + len(answer_prefix) if marker_start is not None else None
+    semantic_pattern = (
+        rf"{re.escape(answer_prefix)}(?P<leading_whitespace>\s*)"
+        rf"(?P<value>{value_pattern})(?P<trailing_whitespace>\s*)"
+    )
+    exact_pattern = rf"{re.escape(answer_prefix)}(?P<value>{value_pattern})"
+    semantic_match = (
+        re.search(rf"{semantic_pattern}\Z", text)
+        if reasoning
+        else re.fullmatch(semantic_pattern, text)
+    )
+    exact_match = (
+        re.search(rf"{exact_pattern}\Z", text)
+        if reasoning
+        else re.fullmatch(exact_pattern, text)
+    )
+    reverse = {surface: label for label, surface in alternatives}
+    choice = reverse[semantic_match.group("value")] if semantic_match else None
+    if marker_start is None:
+        break_reason = "missing_answer_marker"
+    elif semantic_match is None:
+        break_reason = "invalid_or_nonterminal_answer"
+    else:
+        break_reason = None
+    return {
+        "model_choice": choice,
+        "answer_marker_present": marker_start is not None,
+        "answer_marker_count": len(marker_positions),
+        "answer_marker_char_start": marker_start,
+        "answer_marker_char_end": marker_end,
+        "answer_value_char_start": (
+            semantic_match.start("value") if semantic_match is not None else None
+        ),
+        "answer_value_char_end": (
+            semantic_match.end("value") if semantic_match is not None else None
+        ),
+        "answer_value_surface": (
+            semantic_match.group("value") if semantic_match is not None else None
+        ),
+        "answer_leading_whitespace": (
+            semantic_match.group("leading_whitespace")
+            if semantic_match is not None
+            else None
+        ),
+        "answer_trailing_whitespace": (
+            semantic_match.group("trailing_whitespace")
+            if semantic_match is not None
+            else None
+        ),
+        "answer_leading_whitespace_character_count": (
+            len(semantic_match.group("leading_whitespace"))
+            if semantic_match is not None
+            else None
+        ),
+        "answer_trailing_whitespace_character_count": (
+            len(semantic_match.group("trailing_whitespace"))
+            if semantic_match is not None
+            else None
+        ),
+        "semantic_answer_compliance": semantic_match is not None,
+        "exact_answer_format_compliance": exact_match is not None,
+        # Backward-compatible name: compliance now means a semantically valid terminal answer.
+        "strict_answer_compliance": semantic_match is not None,
+        "compliance_break": break_reason,
+    }
 
 
 def _model_layers(model: Any) -> list[Any]:
@@ -298,19 +422,14 @@ class QwenRunner:
         self._effective_batch_sizes: list[int] = []
         self._effective_capture_batch_sizes: list[int] = []
         self._effective_score_batch_sizes: list[int] = []
+        self._generation_backend_metadata: dict[str, object] = {
+            "backend": "transformers"
+        }
 
-    def _ensure_loaded(self) -> None:
-        if self.model is not None and self.tokenizer is not None:
-            if self.device is None:
-                self.device = self.model.get_input_embeddings().weight.device
+    def _ensure_tokenizer_loaded(self) -> None:
+        if self.tokenizer is not None:
             return
-        import torch
-        from transformers import (
-            AutoConfig,
-            AutoModelForCausalLM,
-            AutoProcessor,
-            Qwen3_5ForConditionalGeneration,
-        )
+        from transformers import AutoProcessor
 
         config = self.model_config
         processor = AutoProcessor.from_pretrained(
@@ -323,6 +442,22 @@ class QwenRunner:
         tokenizer.padding_side = "left"
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
+        self.tokenizer = tokenizer
+
+    def _ensure_loaded(self) -> None:
+        self._ensure_tokenizer_loaded()
+        if self.model is not None:
+            if self.device is None:
+                self.device = self.model.get_input_embeddings().weight.device
+            return
+        import torch
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            Qwen3_5ForConditionalGeneration,
+        )
+
+        config = self.model_config
         load_kwargs: dict[str, object] = {
             "revision": config.revision,
             "trust_remote_code": config.trust_remote_code,
@@ -354,7 +489,6 @@ class QwenRunner:
         model = model_class.from_pretrained(config.model_name_or_path, **load_kwargs)
         model.eval()
         self.model = model
-        self.tokenizer = tokenizer
         self.device = model.get_input_embeddings().weight.device
         self.model_metadata = {
             "architecture": type(model).__name__,
@@ -362,7 +496,302 @@ class QwenRunner:
             "revision": config.revision,
             "model_type": architecture_config.model_type,
             "quantization_config": getattr(architecture_config, "quantization_config", None),
+            "completion_generation": self._generation_backend_metadata,
         }
+
+    @staticmethod
+    def _free_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+
+    @staticmethod
+    def _server_log_tail(log_file: Any, *, characters: int = 12_000) -> str:
+        log_file.flush()
+        position = log_file.tell()
+        log_file.seek(0)
+        contents = log_file.read()
+        log_file.seek(position)
+        return str(contents)[-characters:]
+
+    @contextlib.contextmanager
+    def _sglang_mtp_server(self, config: SGLangMTPConfig):
+        python_executable = Path(config.python_executable).expanduser()
+        if not python_executable.is_absolute():
+            python_executable = Path.cwd() / python_executable
+        if not python_executable.is_file():
+            raise FileNotFoundError(
+                "SGLang MTP is enabled but its Python executable does not exist: "
+                f"{python_executable}"
+            )
+
+        port = self._free_loopback_port()
+        base_url = f"http://127.0.0.1:{port}"
+        command = [
+            str(python_executable),
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            self.model_config.model_name_or_path,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dtype",
+            self.model_config.dtype,
+            "--context-length",
+            str(config.context_length),
+            "--mem-fraction-static",
+            str(config.mem_fraction_static),
+            "--cuda-graph-max-bs-decode",
+            str(config.cuda_graph_max_batch_size),
+            "--cuda-graph-backend-prefill",
+            "disabled",
+            "--attention-backend",
+            config.attention_backend,
+            "--sampling-backend",
+            config.sampling_backend,
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-num-steps",
+            str(config.speculative_num_steps),
+            "--speculative-eagle-topk",
+            str(config.speculative_eagle_topk),
+            "--speculative-num-draft-tokens",
+            str(config.speculative_num_draft_tokens),
+            "--log-level",
+            "warning",
+        ]
+        if config.mamba_ssm_dtype is not None:
+            command.extend(["--mamba-ssm-dtype", config.mamba_ssm_dtype])
+        command.extend(
+            ["--mamba-full-memory-ratio", str(config.mamba_full_memory_ratio)]
+        )
+        if self.model_config.revision:
+            command.extend(["--revision", self.model_config.revision])
+        if self.model_config.trust_remote_code:
+            command.append("--trust-remote-code")
+
+        environment = os.environ.copy()
+        if self.model_config.local_files_only:
+            environment.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+
+        started = time.monotonic()
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as server_log:
+            process = subprocess.Popen(
+                command,
+                env=environment,
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+            try:
+                deadline = started + config.startup_timeout_seconds
+                last_error: BaseException | None = None
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        raise RuntimeError(
+                            f"SGLang exited during startup with status {process.returncode}.\n"
+                            f"{self._server_log_tail(server_log)}"
+                        )
+                    try:
+                        with urllib.request.urlopen(
+                            f"{base_url}/model_info", timeout=2
+                        ) as response:
+                            if response.status == 200:
+                                break
+                    except (OSError, urllib.error.URLError) as error:
+                        last_error = error
+                    time.sleep(1)
+                else:
+                    raise TimeoutError(
+                        "SGLang did not become ready within "
+                        f"{config.startup_timeout_seconds:g} seconds; last error={last_error!r}.\n"
+                        f"{self._server_log_tail(server_log)}"
+                    )
+                print(
+                    "SGLang native MTP ready for "
+                    f"{self.model_config.model_name_or_path} after "
+                    f"{time.monotonic() - started:.1f}s "
+                    f"(NEXTN steps={config.speculative_num_steps}, "
+                    f"topk={config.speculative_eagle_topk}, "
+                    f"draft_tokens={config.speculative_num_draft_tokens}).",
+                    flush=True,
+                )
+                yield base_url
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=10)
+
+    def _generate_completion_with_sglang_mtp(
+        self,
+        items: Sequence[tuple[str, str]],
+        *,
+        batch_size: int,
+        max_new_tokens: int,
+        generation_kwargs: Mapping[str, object],
+        config: SGLangMTPConfig,
+    ) -> dict[str, dict[str, object]]:
+        allowed_generation_kwargs = {
+            "frequency_penalty",
+            "ignore_eos",
+            "min_new_tokens",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+            "stop",
+            "stop_token_ids",
+            "top_k",
+            "top_p",
+        }
+        unsupported = set(generation_kwargs) - allowed_generation_kwargs
+        if unsupported:
+            raise ValueError(
+                "SGLang MTP completion generation does not support these generation_kwargs: "
+                + ", ".join(sorted(unsupported))
+            )
+
+        prompt_lengths = {}
+        for row_id, prompt in items:
+            try:
+                token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            except TypeError:
+                token_ids = self.tokenizer.encode(prompt)
+            prompt_lengths[row_id] = len(token_ids)
+        longest_prompt = max(prompt_lengths.values(), default=0)
+        if longest_prompt + max_new_tokens > config.context_length:
+            raise ValueError(
+                "SGLang context_length is too small for completion generation: "
+                "longest prompt has "
+                f"{longest_prompt} tokens and max_new_tokens={max_new_tokens}, but "
+                f"context_length={config.context_length}."
+            )
+
+        results: dict[str, dict[str, object]] = {}
+        total_accepted = 0
+        total_proposed = 0
+        generated_tokens = 0
+        request_groups = 0
+        with self._sglang_mtp_server(config) as base_url:
+            sampling_params: dict[str, object] = {
+                **dict(generation_kwargs),
+                "temperature": 0.0,
+                "max_new_tokens": max_new_tokens,
+            }
+            eos_ids = sorted(self._eos_ids(sampling_params.get("stop_token_ids")))
+            if "stop_token_ids" not in sampling_params and eos_ids:
+                sampling_params["stop_token_ids"] = eos_ids
+            generation_started = time.monotonic()
+            for start in range(0, len(items), batch_size):
+                chunk = items[start : start + batch_size]
+                payload = {
+                    "text": [prompt for _, prompt in chunk],
+                    "sampling_params": sampling_params,
+                }
+                request = urllib.request.Request(
+                    f"{base_url}/generate",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(
+                        request, timeout=config.request_timeout_seconds
+                    ) as response:
+                        outputs = json.load(response)
+                except (OSError, urllib.error.URLError) as error:
+                    raise RuntimeError(
+                        f"SGLang MTP completion batch {request_groups + 1} failed."
+                    ) from error
+                if not isinstance(outputs, list) or len(outputs) != len(chunk):
+                    raise RuntimeError(
+                        "SGLang returned an unexpected number of generations: "
+                        f"expected {len(chunk)}, got "
+                        f"{len(outputs) if isinstance(outputs, list) else type(outputs).__name__}."
+                    )
+
+                for (row_id, _), output in zip(chunk, outputs):
+                    output_ids = [int(token_id) for token_id in output.get("output_ids", [])]
+                    meta = dict(output.get("meta_info", {}))
+                    finish_reason = meta.get("finish_reason")
+                    finish_type = (
+                        finish_reason.get("type")
+                        if isinstance(finish_reason, Mapping)
+                        else finish_reason
+                    )
+                    matched_stop = (
+                        finish_reason.get("matched")
+                        if isinstance(finish_reason, Mapping)
+                        else None
+                    )
+                    total_accepted += int(meta.get("spec_accepted_drafts", 0))
+                    total_proposed += int(meta.get("spec_proposed_drafts", 0))
+                    generated_tokens += len(output_ids)
+                    results[row_id] = {
+                        "text": str(output.get("text", "")),
+                        "token_ids": output_ids,
+                        "generated_token_ids": output_ids,
+                        "generated_sequence_token_ids": output_ids,
+                        "terminal_stop_token_id": (
+                            int(matched_stop)
+                            if isinstance(matched_stop, int)
+                            else None
+                        ),
+                        "finish_reason": finish_reason,
+                        "completion_length": len(output_ids),
+                        "reached_eos": finish_type == "stop",
+                        "hit_token_cap": finish_type == "length",
+                        "effective_batch_size": len(chunk),
+                        "generation_backend": "sglang_native_mtp",
+                        "mtp_metrics": {
+                            key: meta[key]
+                            for key in (
+                                "spec_accept_rate",
+                                "spec_accept_length",
+                                "spec_accepted_drafts",
+                                "spec_proposed_drafts",
+                                "spec_verify_ct",
+                            )
+                            if key in meta
+                        },
+                    }
+                request_groups += 1
+
+            acceptance = (
+                total_accepted / total_proposed if total_proposed else float("nan")
+            )
+            print(
+                f"SGLang MTP continuous completion generation: {len(items)} rows in "
+                f"{request_groups} batch(es), {generated_tokens} output tokens, "
+                f"draft acceptance={acceptance:.1%}, "
+                f"elapsed={time.monotonic() - generation_started:.1f}s.",
+                flush=True,
+            )
+
+        self._generation_backend_metadata = {
+            "backend": "sglang_native_mtp",
+            "algorithm": "NEXTN",
+            "speculative_num_steps": config.speculative_num_steps,
+            "speculative_eagle_topk": config.speculative_eagle_topk,
+            "speculative_num_draft_tokens": config.speculative_num_draft_tokens,
+            "context_length": config.context_length,
+            "attention_backend": config.attention_backend,
+            "sampling_backend": config.sampling_backend,
+            "mamba_ssm_dtype": config.mamba_ssm_dtype,
+            "mamba_full_memory_ratio": config.mamba_full_memory_ratio,
+            "request_groups": request_groups,
+            "accepted_drafts": total_accepted,
+            "proposed_drafts": total_proposed,
+            "acceptance_rate": (
+                total_accepted / total_proposed if total_proposed else None
+            ),
+        }
+        return results
 
     def _serialize(self, messages: Sequence[Mapping[str, str]]) -> str:
         kwargs = {
@@ -377,39 +806,6 @@ class QwenRunner:
             rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
         if not isinstance(rendered, str):
             raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
-        return rendered
-
-    def _serialize_continued_assistant(
-        self, messages: Sequence[Mapping[str, str]]
-    ) -> str:
-        """Serialize a final assistant prefill without closing that message."""
-
-        if not messages or messages[-1].get("role") != "assistant":
-            raise ValueError("Continued serialization requires a final assistant message.")
-        kwargs: dict[str, object] = {
-            "tokenize": False,
-            "add_generation_prompt": False,
-            "continue_final_message": True,
-            "enable_thinking": False,
-        }
-        try:
-            rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
-        except TypeError:
-            # Simple or older tokenizers may not expose Qwen's optional template kwargs.
-            kwargs.pop("enable_thinking")
-            try:
-                rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
-            except TypeError:
-                kwargs.pop("continue_final_message")
-                rendered = self.tokenizer.apply_chat_template(list(messages), **kwargs)
-        if not isinstance(rendered, str):
-            raise TypeError("apply_chat_template(..., tokenize=False) must return a string.")
-        assistant_prefill = str(messages[-1]["content"])
-        if not rendered.endswith(assistant_prefill):
-            raise ValueError(
-                "The tokenizer closed or altered the continued assistant prefill; candidate "
-                "logits would not be measured immediately after the configured answer prefix."
-            )
         return rendered
 
     def _encode_prompts(self, prompts: Sequence[str]) -> dict[str, Any]:
@@ -447,12 +843,27 @@ class QwenRunner:
             "attention_mask": mask.to(self.device),
         }
 
-    def _eos_ids(self) -> set[int]:
-        raw = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
-        if raw is None:
-            raw = getattr(self.tokenizer, "eos_token_id", None)
+    @staticmethod
+    def _normalize_token_ids(raw: object) -> set[int]:
         values = raw if isinstance(raw, (tuple, list, set)) else [raw]
         return {int(value) for value in values if value is not None}
+
+    def _eos_ids(self, override: object | None = None) -> set[int]:
+        if override is not None:
+            return self._normalize_token_ids(override)
+        # Qwen checkpoints can expose <|endoftext|> through generation_config while
+        # the tokenizer's EOS is the earlier <|im_end|> assistant-turn delimiter.
+        # Either token must end this assistant turn.
+        return {
+            *self._normalize_token_ids(
+                getattr(
+                    getattr(self.model, "generation_config", None),
+                    "eos_token_id",
+                    None,
+                )
+            ),
+            *self._normalize_token_ids(getattr(self.tokenizer, "eos_token_id", None)),
+        }
 
     def _generate_once(
         self,
@@ -461,12 +872,51 @@ class QwenRunner:
         max_new_tokens: int,
         generation_kwargs: Mapping[str, object],
         capture_first_token_logits: bool = False,
+        allowed_token_sequences_by_row: (
+            Mapping[str, Sequence[Sequence[int]]] | None
+        ) = None,
     ) -> dict[str, dict[str, object]]:
         import torch
 
         prompts = [prompt for _, prompt in items]
         encoded = self._encode_prompts(prompts)
         kwargs = {"do_sample": False, **dict(generation_kwargs)}
+        eos_ids = self._eos_ids(kwargs.get("eos_token_id"))
+        if "eos_token_id" not in kwargs and eos_ids:
+            kwargs["eos_token_id"] = sorted(eos_ids)
+        prefix_width = encoded["input_ids"].shape[1]
+        if allowed_token_sequences_by_row is not None:
+            allowed_by_batch_index = [
+                [
+                    [int(token_id) for token_id in sequence]
+                    for sequence in allowed_token_sequences_by_row[row_id]
+                ]
+                for row_id, _ in items
+            ]
+            if any(
+                not sequences or any(not sequence for sequence in sequences)
+                for sequences in allowed_by_batch_index
+            ):
+                raise ValueError(
+                    "Every constrained row needs at least one non-empty token sequence."
+                )
+            allowed_eos_ids = sorted(eos_ids)
+            if not allowed_eos_ids:
+                raise ValueError("Constrained answer generation requires an EOS token ID.")
+
+            def prefix_allowed_tokens_fn(batch_id: int, input_ids: Any) -> list[int]:
+                generated_ids = [
+                    int(token_id) for token_id in input_ids[prefix_width:].tolist()
+                ]
+                next_token_ids = {
+                    sequence[len(generated_ids)]
+                    for sequence in allowed_by_batch_index[batch_id]
+                    if len(sequence) > len(generated_ids)
+                    and sequence[: len(generated_ids)] == generated_ids
+                }
+                return sorted(next_token_ids) if next_token_ids else allowed_eos_ids
+
+            kwargs["prefix_allowed_tokens_fn"] = prefix_allowed_tokens_fn
         if capture_first_token_logits:
             kwargs.update({"return_dict_in_generate": True, "output_logits": True})
         with torch.inference_mode():
@@ -478,9 +928,7 @@ class QwenRunner:
             if generated_logits is not None and len(generated_logits) > 0
             else None
         )
-        prefix_width = encoded["input_ids"].shape[1]
         continuation = sequences[:, prefix_width:]
-        eos_ids = self._eos_ids()
         records: dict[str, dict[str, object]] = {}
         for row_index, ((row_id, _), tokens) in enumerate(zip(items, continuation)):
             token_list = [int(token) for token in tokens.detach().cpu().tolist()]
@@ -490,6 +938,13 @@ class QwenRunner:
             records[row_id] = {
                 "text": text,
                 "token_ids": effective,
+                "generated_token_ids": effective,
+                "generated_sequence_token_ids": (
+                    token_list if stop is None else token_list[: stop + 1]
+                ),
+                "terminal_stop_token_id": (
+                    token_list[stop] if stop is not None else None
+                ),
                 "completion_length": len(effective),
                 "reached_eos": stop is not None,
                 "hit_token_cap": stop is None and len(token_list) >= max_new_tokens,
@@ -507,6 +962,9 @@ class QwenRunner:
         max_new_tokens: int,
         generation_kwargs: Mapping[str, object],
         capture_first_token_logits: bool = False,
+        allowed_token_sequences_by_row: (
+            Mapping[str, Sequence[Sequence[int]]] | None
+        ) = None,
     ) -> dict[str, dict[str, object]]:
         if not items:
             return {}
@@ -516,6 +974,7 @@ class QwenRunner:
                 max_new_tokens=max_new_tokens,
                 generation_kwargs=generation_kwargs,
                 capture_first_token_logits=capture_first_token_logits,
+                allowed_token_sequences_by_row=allowed_token_sequences_by_row,
             )
         except RuntimeError as error:
             if not _is_oom(error) or len(items) == 1:
@@ -532,12 +991,14 @@ class QwenRunner:
                     max_new_tokens=max_new_tokens,
                     generation_kwargs=generation_kwargs,
                     capture_first_token_logits=capture_first_token_logits,
+                    allowed_token_sequences_by_row=allowed_token_sequences_by_row,
                 ),
                 **self._generate_resilient(
                     items[midpoint:],
                     max_new_tokens=max_new_tokens,
                     generation_kwargs=generation_kwargs,
                     capture_first_token_logits=capture_first_token_logits,
+                    allowed_token_sequences_by_row=allowed_token_sequences_by_row,
                 ),
             }
 
@@ -607,6 +1068,23 @@ class QwenRunner:
                     token = self.tokenizer.decode([token_id])
                 tokens.append(str(token))
         return {"input_ids": input_ids, "tokens": tokens}
+
+    def _generated_token_boundary(
+        self, token_ids: Sequence[int], text: str, char_end: int
+    ) -> int | None:
+        """Return the exact generated-token boundary for a character boundary."""
+
+        if not 0 <= char_end <= len(text):
+            return None
+        for count in range(len(token_ids) + 1):
+            prefix = self.tokenizer.decode(
+                list(token_ids[:count]), skip_special_tokens=True
+            )
+            if prefix == text[:char_end]:
+                return count
+            if len(prefix) > char_end:
+                return None
+        return None
 
     def _score_batch(
         self, prompts: Sequence[str], metric_specs: Sequence[MetricSpec]
@@ -734,6 +1212,7 @@ class QwenRunner:
         spec: CaptureSpec,
         run_dir: Path,
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
+        boundary_token_counts: Mapping[str, int | None] | None = None,
         metric_specs: Mapping[str, MetricSpec] | None = None,
         capture_logits: bool = True,
     ) -> dict[str, dict[str, object]]:
@@ -797,7 +1276,19 @@ class QwenRunner:
                     unpadded_logits = logits[row_index]
                 else:
                     unpadded_logits = logits[row_index][mask]
-                if decode_token_ids is not None and spec.every_decode_position:
+                boundary_count = (
+                    boundary_token_counts.get(row_id)
+                    if boundary_token_counts is not None
+                    else None
+                )
+                if boundary_token_counts is not None:
+                    if boundary_count is None:
+                        selected = None
+                    else:
+                        selected = unpadded_logits[
+                            len(prompt_ids[row_index]) + boundary_count - 1
+                        ]
+                elif decode_token_ids is not None and spec.every_decode_position:
                     count = len(decode_token_ids[row_id])
                     start = len(prompt_ids[row_index]) - 1
                     selected = unpadded_logits[start : start + count]
@@ -806,7 +1297,9 @@ class QwenRunner:
                 else:
                     indices = resolve_selector(spec.logit_tokens, len(unpadded_logits))
                     selected = unpadded_logits[indices]
-                if spec.logits_scope == "full":
+                if selected is None:
+                    pass
+                elif spec.logits_scope == "full":
                     logit_tensors[f"{boundary}.logits"] = selected.float().cpu()
                 else:
                     if metric_specs is None or row_id not in metric_specs:
@@ -857,6 +1350,7 @@ class QwenRunner:
         spec: CaptureSpec,
         run_dir: Path,
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
+        boundary_token_counts: Mapping[str, int | None] | None = None,
         metric_specs: Mapping[str, MetricSpec] | None = None,
         capture_logits: bool = True,
     ) -> dict[str, dict[str, object]]:
@@ -869,6 +1363,7 @@ class QwenRunner:
                 spec=spec,
                 run_dir=run_dir,
                 decode_token_ids=decode_token_ids,
+                boundary_token_counts=boundary_token_counts,
                 metric_specs=metric_specs,
                 capture_logits=capture_logits,
             )
@@ -891,6 +1386,16 @@ class QwenRunner:
                 if decode_token_ids is not None
                 else None
             )
+            first_boundaries = (
+                {row_id: boundary_token_counts[row_id] for row_id, _ in items[:midpoint]}
+                if boundary_token_counts is not None
+                else None
+            )
+            second_boundaries = (
+                {row_id: boundary_token_counts[row_id] for row_id, _ in items[midpoint:]}
+                if boundary_token_counts is not None
+                else None
+            )
             return {
                 **self._capture_resilient(
                     items=items[:midpoint],
@@ -898,6 +1403,7 @@ class QwenRunner:
                     spec=spec,
                     run_dir=run_dir,
                     decode_token_ids=first_ids,
+                    boundary_token_counts=first_boundaries,
                     metric_specs=metric_specs,
                     capture_logits=capture_logits,
                 ),
@@ -907,13 +1413,14 @@ class QwenRunner:
                     spec=spec,
                     run_dir=run_dir,
                     decode_token_ids=second_ids,
+                    boundary_token_counts=second_boundaries,
                     metric_specs=metric_specs,
                     capture_logits=capture_logits,
                 ),
             }
 
     def execute(self, dataset: TranscriptDataset, config: ExecutionConfig) -> TranscriptDataset:
-        self._ensure_loaded()
+        self._ensure_tokenizer_loaded()
         runtime_tokenizer_fingerprint = TokenizerBinding(self.tokenizer).fingerprint
         root = Path(config.experiment_dir) if config.experiment_dir else dataset.experiment_dir
         if root is None:
@@ -927,332 +1434,363 @@ class QwenRunner:
                 if line.strip():
                     row = json.loads(line)
                     completed[str(row["row_id"])] = row
-        pending = [row for row in dataset if row["row_id"] not in completed]
+        pending = [row for row in dataset if str(row["row_id"]) not in completed]
+        pending_by_id = {str(row["row_id"]): row for row in pending}
         self._oom_retries = 0
         self._effective_batch_sizes = []
         self._effective_capture_batch_sizes = []
         self._effective_score_batch_sizes = []
+        self._generation_backend_metadata = {"backend": "transformers"}
 
-        reasoning_rows = [row for row in pending if int(row["reasoning_budget"]) > 0]
-        reasoning_items = [
-            (str(row["row_id"]), self._serialize(row["messages"]))  # type: ignore[arg-type]
-            for row in reasoning_rows
-        ]
-        reasoning_prompts_by_id = dict(reasoning_items)
-        reasoning_prompt_records = {
-            row_id: self._prompt_token_record(prompt) for row_id, prompt in reasoning_items
+        generation_messages: dict[str, list[dict[str, str]]] = {}
+        generation_items: list[tuple[str, str]] = []
+        for source in pending:
+            row_id = str(source["row_id"])
+            messages = [dict(message) for message in source["messages"]]  # type: ignore[union-attr]
+            prompt = self._serialize(messages)
+            generation_messages[row_id] = messages
+            generation_items.append((row_id, prompt))
+        prompt_records = {
+            row_id: self._prompt_token_record(prompt) for row_id, prompt in generation_items
         }
-        reasoning_results: dict[str, dict[str, object]] = {}
-        reasoning_batch_size = config.batch_size_for("reasoning")
-        for reasoning_budget in sorted(
-            {int(row["reasoning_budget"]) for row in reasoning_rows}
-        ):
-            budget_row_ids = {
-                str(row["row_id"])
-                for row in reasoning_rows
-                if int(row["reasoning_budget"]) == reasoning_budget
-            }
-            budget_items = [item for item in reasoning_items if item[0] in budget_row_ids]
-            reasoning_results.update(
-                self._run_bucketed(
-                    budget_items,
-                    batch_size=reasoning_batch_size,
-                    max_new_tokens=config.max_reasoning_tokens,
-                    generation_kwargs=config.generation_kwargs,
-                )
+
+        if config.completion_mtp.enabled and generation_items:
+            completion_results = self._generate_completion_with_sglang_mtp(
+                generation_items,
+                batch_size=config.batch_size_for("completion"),
+                max_new_tokens=config.max_completion_tokens,
+                generation_kwargs=config.generation_kwargs,
+                config=config.completion_mtp,
             )
-        for completion in reasoning_results.values():
-            raw_text = str(completion["text"])
-            cleaned_text = strip_thinking_markers(raw_text)
-            completion["raw_text"] = raw_text
-            completion["text"] = cleaned_text
-            completion["thinking_markers_removed"] = cleaned_text != raw_text.strip()
+            self._ensure_loaded()
+            self.model_metadata["completion_generation"] = self._generation_backend_metadata
+        else:
+            self._ensure_loaded()
+            completion_results = self._run_bucketed(
+                generation_items,
+                batch_size=config.batch_size_for("completion"),
+                max_new_tokens=config.max_completion_tokens,
+                generation_kwargs=config.generation_kwargs,
+            )
+
+        metric_specs_by_id = {
+            row_id: config.metrics.resolve(x=int(source["x"]), y=int(source["y"]))
+            for row_id, source in pending_by_id.items()
+        }
+        contract_by_id: dict[str, dict[str, object]] = {}
+        boundary_token_counts: dict[str, int | None] = {}
+        full_completion_by_id: dict[str, str] = {}
+        for row_id, source in pending_by_id.items():
+            completion = completion_results[row_id]
+            generated_ids = [
+                int(token_id)
+                for token_id in completion.get("generated_token_ids", completion["token_ids"])
+            ]
+            completion["token_ids"] = generated_ids
+            completion["generated_token_ids"] = generated_ids
+            completion.setdefault("generated_sequence_token_ids", generated_ids)
+            generated_text = str(completion["text"])
+            full_completion = (
+                generated_text
+                if bool(source["reasoning"])
+                else str(source.get("answer_prefix", "ANSWER:")) + generated_text
+            )
+            full_completion_by_id[row_id] = full_completion
+            surfaces = metric_specs_by_id[row_id].surfaces
+            contract = parse_completion_contract(
+                full_completion,
+                reasoning=bool(source["reasoning"]),
+                allow_same=bool(source["allow_same"]),
+                x_surface=str(surfaces["X"]),
+                y_surface=str(surfaces["Y"]),
+                same_surface=str(surfaces["SAME"]),
+                answer_prefix=str(source.get("answer_prefix", "ANSWER:")),
+            )
+            value_start = contract["answer_value_char_start"]
+            answer_prefix = str(source.get("answer_prefix", "ANSWER:"))
+            generated_value_start = (
+                int(value_start)
+                if bool(source["reasoning"]) and value_start is not None
+                else int(value_start) - len(answer_prefix)
+                if value_start is not None
+                else None
+            )
+            value_end = contract["answer_value_char_end"]
+            generated_value_end = (
+                int(value_end)
+                if bool(source["reasoning"]) and value_end is not None
+                else int(value_end) - len(answer_prefix)
+                if value_end is not None
+                else None
+            )
+            marker_end = contract["answer_marker_char_end"]
+            generated_marker_end = (
+                int(marker_end)
+                if bool(source["reasoning"]) and marker_end is not None
+                else 0
+                if marker_end is not None
+                else None
+            )
+            # For reasoning-off, full_completion has a synthetic ANSWER: prefix and
+            # generated_text starts immediately after it. In both modes this consumes
+            # exactly the generated whitespace before the actual terminal candidate.
+            boundary_count = (
+                self._generated_token_boundary(
+                    generated_ids, generated_text, generated_value_start
+                )
+                if generated_value_start is not None
+                else None
+            )
+            marker_boundary_count = (
+                self._generated_token_boundary(
+                    generated_ids, generated_text, generated_marker_end
+                )
+                if generated_marker_end is not None
+                else None
+            )
+            value_end_boundary_count = (
+                self._generated_token_boundary(
+                    generated_ids, generated_text, generated_value_end
+                )
+                if generated_value_end is not None
+                else None
+            )
+            contract["answer_boundary_break"] = (
+                "answer_candidate_not_at_token_boundary"
+                if value_start is not None and boundary_count is None
+                else None
+            )
+            contract["answer_marker_generated_token_count"] = marker_boundary_count
+            contract["answer_value_end_generated_token_count"] = value_end_boundary_count
+            contract["answer_leading_whitespace_token_ids"] = (
+                generated_ids[marker_boundary_count:boundary_count]
+                if marker_boundary_count is not None and boundary_count is not None
+                else None
+            )
+            contract["answer_value_generated_token_ids"] = (
+                generated_ids[boundary_count:value_end_boundary_count]
+                if boundary_count is not None and value_end_boundary_count is not None
+                else None
+            )
+            contract["answer_trailing_whitespace_token_ids"] = (
+                generated_ids[value_end_boundary_count:]
+                if value_end_boundary_count is not None
+                else None
+            )
+            boundary_token_counts[row_id] = boundary_count
+            contract_by_id[row_id] = contract
+
         capture_records: dict[str, dict[str, object]] = {}
-        if "reasoning" in config.capture.logits_boundaries or config.capture.streams:
+        if config.capture.enabled:
             capture_batch_size = config.batch_size_for("capture")
-            reasoning_metric_specs = {
-                str(row["row_id"]): config.metrics.resolve(
-                    x=int(row["x"]), y=int(row["y"])
-                )
-                for row in reasoning_rows
-            }
-            for start in range(0, len(reasoning_items), capture_batch_size):
-                capture_items = reasoning_items[start : start + capture_batch_size]
-                reasoning_decode_ids = (
-                    {
-                        row_id: reasoning_results[row_id]["token_ids"]
-                        for row_id, _ in capture_items
-                    }
-                    if config.capture.every_decode_position
-                    else None
-                )
+            for start in range(0, len(generation_items), capture_batch_size):
+                capture_items = generation_items[start : start + capture_batch_size]
+                decode_ids = {
+                    row_id: completion_results[row_id]["generated_sequence_token_ids"]
+                    for row_id, _ in capture_items
+                }
+                boundaries = {
+                    row_id: boundary_token_counts[row_id] for row_id, _ in capture_items
+                }
                 captured = self._capture_resilient(
                     items=capture_items,
-                    boundary="reasoning",
+                    boundary="answer",
                     spec=config.capture,
                     run_dir=run_dir,
-                    decode_token_ids=reasoning_decode_ids,
-                    metric_specs=reasoning_metric_specs,
+                    decode_token_ids=decode_ids,
+                    boundary_token_counts=boundaries,
+                    metric_specs=metric_specs_by_id,
                 )
-                for row_id, paths in captured.items():
-                    capture_records.setdefault(row_id, {}).update(paths)
+                for row_id, values in captured.items():
+                    capture_records.setdefault(row_id, {}).update(values)
 
-        answer_items: list[tuple[str, str]] = []
-        answer_messages: dict[str, list[dict[str, str]]] = {}
-        enforced_by_id: dict[str, str] = {}
-        for row in pending:
-            row_id = str(row["row_id"])
-            answer_prefix = str(row.get("answer_prefix", "ANSWER:"))
-            if int(row["reasoning_budget"]) > 0:
-                enforced = enforce_reasoning(
-                    str(reasoning_results[row_id]["text"]), int(row["reasoning_budget"])
-                )
-                enforced_by_id[row_id] = enforced
-                base_messages = stage_two_messages(
-                    first_messages=row["messages"],  # type: ignore[arg-type]
-                    enforced_reasoning=enforced,
-                    layout=str(row["call_layout"]),  # type: ignore[arg-type]
-                    answer_prefix=answer_prefix,
-                )
-                messages = base_messages
+        score_records: dict[str, dict[str, object]] = {}
+        for row_id, _ in generation_items:
+            # Sequence scoring is normally disabled for this experiment. The prompt text here
+            # is retained for backward compatibility; answer-boundary logits above always use
+            # the exact teacher-forced token sequence.
+            boundary_count = boundary_token_counts[row_id]
+            prompt_ids = list(prompt_records[row_id]["input_ids"])
+            generated_ids = list(completion_results[row_id]["generated_token_ids"])
+            boundary_ids = (
+                prompt_ids + generated_ids[:boundary_count]
+                if boundary_count is not None
+                else prompt_ids
+            )
+            boundary_prompt = self.tokenizer.decode(boundary_ids, skip_special_tokens=False)
+            score_records[row_id] = self._score_resilient(
+                [boundary_prompt], [metric_specs_by_id[row_id]]
+            )[0]
+
+        for row_id, prompt in generation_items:
+            source = pending_by_id[row_id]
+            completion = completion_results[row_id]
+            contract = contract_by_id[row_id]
+            score_record = score_records[row_id]
+            answer_surfaces = score_record["answer_surfaces"]
+            answer_surface_token_ids = score_record["answer_surface_token_ids"]
+            choice = contract["model_choice"]
+            candidate_1 = int(source.get("candidate_1", source["x"]))
+            x_is_candidate_1 = int(source["x"]) == candidate_1
+            candidate_1_label = "X" if x_is_candidate_1 else "Y"
+            candidate_2_label = "Y" if x_is_candidate_1 else "X"
+            candidate_1_answer_surface = answer_surfaces[candidate_1_label]
+            candidate_2_answer_surface = answer_surfaces[candidate_2_label]
+            candidate_1_answer_token_ids = answer_surface_token_ids[candidate_1_label]
+            candidate_2_answer_token_ids = answer_surface_token_ids[candidate_2_label]
+            if choice == "SAME":
+                canonical_choice = "SAME"
+                chosen_candidate = "SAME"
+            elif choice in ("X", "Y"):
+                chosen_value = int(source[str(choice).lower()])
+                chosen_candidate = str(chosen_value)
+                canonical_choice = "C1" if chosen_value == candidate_1 else "C2"
             else:
-                base_messages = [  # type: ignore[union-attr]
-                    dict(message) for message in row["messages"]
-                ]
-                messages = [
-                    *base_messages,
-                    {"role": "assistant", "content": answer_prefix},
-                ]
-            prompt = self._serialize_continued_assistant(messages)
-            answer_messages[row_id] = messages
-            answer_items.append((row_id, prompt))
-        answer_prompt_records = {
-            row_id: self._prompt_token_record(prompt) for row_id, prompt in answer_items
-        }
-        pending_by_id = {str(row["row_id"]): row for row in pending}
-        ordered_answer_items = sorted(answer_items, key=lambda item: len(item[1]))
-        answer_batch_size = config.batch_size_for("answer")
-        capture_batch_size = config.batch_size_for("capture")
-        score_batch_size = config.batch_size_for("score")
-        answer_batch_count = (
-            len(ordered_answer_items) + answer_batch_size - 1
-        ) // answer_batch_size
-        for start in range(0, len(ordered_answer_items), answer_batch_size):
-            chunk = ordered_answer_items[start : start + answer_batch_size]
-            metric_specs_by_id = {
-                row_id: config.metrics.resolve(
-                    x=int(pending_by_id[row_id]["x"]),
-                    y=int(pending_by_id[row_id]["y"]),
-                )
-                for row_id, _ in chunk
+                canonical_choice = None
+                chosen_candidate = None
+            ground_truth = source.get("ground_truth_choice")
+            posterior_correct = choice == ground_truth if ground_truth is not None else None
+            canonical_ground_truth = source.get("canonical_ground_truth_choice")
+            canonical_posterior_correct = (
+                canonical_choice == canonical_ground_truth
+                if canonical_ground_truth is not None
+                else None
+            )
+            x_sequence_score = score_record.get("x_sequence_log_probability")
+            y_sequence_score = score_record.get("y_sequence_log_probability")
+            if x_is_candidate_1:
+                candidate_1_sequence_score = x_sequence_score
+                candidate_2_sequence_score = y_sequence_score
+            else:
+                candidate_1_sequence_score = y_sequence_score
+                candidate_2_sequence_score = x_sequence_score
+            positional_logit_difference = score_record.get("x_minus_y_logit")
+            canonical_logit_difference = (
+                float(positional_logit_difference)
+                * (1.0 if x_is_candidate_1 else -1.0)
+                if positional_logit_difference is not None
+                else None
+            )
+            prompt_ids = list(prompt_records[row_id]["input_ids"])
+            generated_ids = list(completion["generated_token_ids"])
+            generated_sequence_ids = list(completion["generated_sequence_token_ids"])
+            boundary_count = boundary_token_counts[row_id]
+            teacher_forced_ids = prompt_ids + generated_sequence_ids
+            reasoning_length = boundary_count if bool(source["reasoning"]) else None
+            record = {
+                **source,
+                "generation_messages": generation_messages[row_id],
+                "generation_serialized_prompt": prompt,
+                "generation_input_ids": prompt_ids,
+                "generation_input_tokens": prompt_records[row_id]["tokens"],
+                "runtime_tokenizer_template_fingerprint": runtime_tokenizer_fingerprint,
+                "completion": completion,
+                "full_completion": full_completion_by_id[row_id],
+                "assistant_completion": full_completion_by_id[row_id],
+                "generated_token_ids": generated_ids,
+                "generated_sequence_token_ids": completion["generated_sequence_token_ids"],
+                "teacher_forced_input_ids": teacher_forced_ids,
+                "teacher_forced_completion_start": len(prompt_ids),
+                "answer_boundary_source": (
+                    "generated_completion"
+                    if bool(source["reasoning"])
+                    else "assistant_role_after_user_marker"
+                ),
+                "answer_boundary_generated_token_count": boundary_count,
+                "answer_boundary_input_index": (
+                    len(prompt_ids) + boundary_count - 1
+                    if boundary_count is not None
+                    else None
+                ),
+                "reasoning_length_tokens": reasoning_length,
+                "model_choice": choice,
+                "model_choice_surface": (
+                    answer_surfaces[choice] if choice is not None else None  # type: ignore[index]
+                ),
+                "model_choice_candidate": chosen_candidate,
+                "model_choice_canonical": canonical_choice,
+                "parse_compliance": bool(contract["strict_answer_compliance"]),
+                "semantic_answer_compliance": bool(
+                    contract["semantic_answer_compliance"]
+                ),
+                "strict_answer_compliance": bool(contract["strict_answer_compliance"]),
+                "exact_answer_format_compliance": bool(
+                    contract["exact_answer_format_compliance"]
+                ),
+                "reasoning_compliance": (
+                    bool(contract["strict_answer_compliance"])
+                    if bool(source["reasoning"])
+                    else None
+                ),
+                "no_reasoning_compliance": (
+                    bool(contract["strict_answer_compliance"])
+                    if not bool(source["reasoning"])
+                    else None
+                ),
+                "compliance_break": contract["compliance_break"],
+                "answer_marker_present": contract["answer_marker_present"],
+                "answer_marker_count": contract["answer_marker_count"],
+                "answer_marker_char_start": contract["answer_marker_char_start"],
+                "answer_marker_char_end": contract["answer_marker_char_end"],
+                "answer_value_char_start": contract["answer_value_char_start"],
+                "answer_value_char_end": contract["answer_value_char_end"],
+                "answer_value_surface": contract["answer_value_surface"],
+                "answer_leading_whitespace": contract["answer_leading_whitespace"],
+                "answer_trailing_whitespace": contract["answer_trailing_whitespace"],
+                "answer_leading_whitespace_character_count": contract[
+                    "answer_leading_whitespace_character_count"
+                ],
+                "answer_trailing_whitespace_character_count": contract[
+                    "answer_trailing_whitespace_character_count"
+                ],
+                "answer_boundary_break": contract["answer_boundary_break"],
+                "answer_marker_generated_token_count": contract[
+                    "answer_marker_generated_token_count"
+                ],
+                "answer_value_end_generated_token_count": contract[
+                    "answer_value_end_generated_token_count"
+                ],
+                "answer_leading_whitespace_token_ids": contract[
+                    "answer_leading_whitespace_token_ids"
+                ],
+                "answer_value_generated_token_ids": contract[
+                    "answer_value_generated_token_ids"
+                ],
+                "answer_trailing_whitespace_token_ids": contract[
+                    "answer_trailing_whitespace_token_ids"
+                ],
+                "posterior_correct": posterior_correct,
+                "canonical_posterior_correct": canonical_posterior_correct,
+                **score_record,
+                "candidate_1_answer_surface": candidate_1_answer_surface,
+                "candidate_2_answer_surface": candidate_2_answer_surface,
+                "candidate_1_answer_token_ids": candidate_1_answer_token_ids,
+                "candidate_2_answer_token_ids": candidate_2_answer_token_ids,
+                "candidate_1_sequence_log_probability": candidate_1_sequence_score,
+                "candidate_2_sequence_log_probability": candidate_2_sequence_score,
+                "candidate_1_minus_candidate_2_logit": canonical_logit_difference,
+                **capture_records.get(row_id, {}),
+                "generation_settings": {
+                    "do_sample": False,
+                    "enable_thinking": False,
+                    "max_completion_tokens": config.max_completion_tokens,
+                    "generation_backend": self._generation_backend_metadata,
+                    **dict(config.generation_kwargs),
+                },
             }
-            capture_surface_logits_from_generation = (
-                "answer" in config.capture.logits_boundaries
-                and config.capture.logits_scope == "answer_surfaces"
-                and not config.capture.every_decode_position
-                and config.capture.logit_tokens == "last"
-            )
-            answer_results = self._generate_resilient(
-                chunk,
-                max_new_tokens=config.max_answer_tokens,
-                generation_kwargs=config.generation_kwargs,
-                capture_first_token_logits=capture_surface_logits_from_generation,
-            )
-            generation_logit_rows: set[str] = set()
-            if capture_surface_logits_from_generation:
-                for row_id, _ in chunk:
-                    first_token_logits = answer_results[row_id].pop(
-                        "_first_token_logits", None
-                    )
-                    if first_token_logits is None:
-                        continue
-                    generation_logit_rows.add(row_id)
-                    surface_logits = self._surface_raw_logits(
-                        first_token_logits, metric_specs_by_id[row_id]
-                    )
-                    capture_records.setdefault(row_id, {})[
-                        "answer_surface_raw_logits"
-                    ] = surface_logits
-            if "answer" in config.capture.logits_boundaries or config.capture.streams:
-                for capture_start in range(0, len(chunk), capture_batch_size):
-                    capture_items = chunk[
-                        capture_start : capture_start + capture_batch_size
-                    ]
-                    capture_row_ids = {row_id for row_id, _ in capture_items}
-                    capture_logits = not (
-                        "answer" in config.capture.logits_boundaries
-                        and capture_row_ids <= generation_logit_rows
-                    )
-                    if not config.capture.streams and not capture_logits:
-                        continue
-                    decode_ids = (
-                        {
-                            row_id: answer_results[row_id]["token_ids"]
-                            for row_id, _ in capture_items
-                        }
-                        if config.capture.every_decode_position
-                        else None
-                    )
-                    captured = self._capture_resilient(
-                        items=capture_items,
-                        boundary="answer",
-                        spec=config.capture,
-                        run_dir=run_dir,
-                        decode_token_ids=decode_ids,
-                        metric_specs=metric_specs_by_id,
-                        capture_logits=capture_logits,
-                    )
-                    for row_id, paths in captured.items():
-                        capture_records.setdefault(row_id, {}).update(paths)
-            scores_by_id: dict[str, dict[str, object]] = {}
-            for score_start in range(0, len(chunk), score_batch_size):
-                score_items = chunk[score_start : score_start + score_batch_size]
-                score_specs = [
-                    metric_specs_by_id[row_id] for row_id, _ in score_items
-                ]
-                score_records = self._score_resilient(
-                    [prompt for _, prompt in score_items], score_specs
-                )
-                scores_by_id.update(
-                    {
-                        row_id: record
-                        for (row_id, _), record in zip(score_items, score_records)
-                    }
-                )
-            for row_id, prompt in chunk:
-                source = pending_by_id[row_id]
-                answer = answer_results[row_id]
-                score_record = scores_by_id[row_id]
-                answer_surfaces = score_record["answer_surfaces"]
-                assistant_completion = str(source.get("answer_prefix", "ANSWER:")) + str(
-                    answer["text"]
-                )
-                choice = parse_model_choice(
-                    assistant_completion,
-                    allow_same=bool(source["allow_same"]),
-                    x_surface=str(answer_surfaces["X"]),  # type: ignore[index]
-                    y_surface=str(answer_surfaces["Y"]),  # type: ignore[index]
-                    same_surface=str(answer_surfaces["SAME"]),  # type: ignore[index]
-                    strict=True,
-                    answer_prefix=str(source.get("answer_prefix", "ANSWER:")),
-                )
-                candidate_1 = int(source.get("candidate_1", source["x"]))
-                candidate_2 = int(source.get("candidate_2", source["y"]))
-                x_is_candidate_1 = int(source["x"]) == candidate_1
-                if choice == "SAME":
-                    canonical_choice = "SAME"
-                    chosen_candidate = "SAME"
-                elif choice == "X":
-                    chosen_value = int(source["x"])
-                    chosen_candidate = str(chosen_value)
-                    if chosen_value == candidate_1:
-                        canonical_choice = "C1"
-                    elif chosen_value == candidate_2:
-                        canonical_choice = "C2"
-                    else:
-                        raise ValueError("Parsed choice is not one of the canonical candidates.")
-                elif choice == "Y":
-                    chosen_value = int(source["y"])
-                    chosen_candidate = str(chosen_value)
-                    if chosen_value == candidate_1:
-                        canonical_choice = "C1"
-                    elif chosen_value == candidate_2:
-                        canonical_choice = "C2"
-                    else:
-                        raise ValueError("Parsed choice is not one of the canonical candidates.")
-                else:
-                    canonical_choice = None
-                    chosen_candidate = None
-                ground_truth = source.get("ground_truth_choice")
-                posterior_correct = choice == ground_truth if ground_truth is not None else None
-                canonical_ground_truth = source.get("canonical_ground_truth_choice")
-                canonical_posterior_correct = (
-                    canonical_choice == canonical_ground_truth
-                    if canonical_ground_truth is not None
-                    else None
-                )
-                x_sequence_score = score_record.get("x_sequence_log_probability")
-                y_sequence_score = score_record.get("y_sequence_log_probability")
-                if x_is_candidate_1:
-                    candidate_1_sequence_score = x_sequence_score
-                    candidate_2_sequence_score = y_sequence_score
-                else:
-                    candidate_1_sequence_score = y_sequence_score
-                    candidate_2_sequence_score = x_sequence_score
-                positional_logit_difference = score_record.get("x_minus_y_logit")
-                canonical_logit_difference = (
-                    float(positional_logit_difference)
-                    * (1.0 if x_is_candidate_1 else -1.0)
-                    if positional_logit_difference is not None
-                    else None
-                )
-                reasoning = reasoning_results.get(row_id)
-                reasoning_prompt_record = reasoning_prompt_records.get(row_id)
-                answer_prompt_record = answer_prompt_records[row_id]
-                record = {
-                    **source,
-                    "answer_messages": answer_messages[row_id],
-                    "reasoning_serialized_prompt": (
-                        reasoning_prompts_by_id[row_id] if reasoning is not None else None
-                    ),
-                    "reasoning_input_ids": (
-                        reasoning_prompt_record["input_ids"] if reasoning_prompt_record else None
-                    ),
-                    "reasoning_input_tokens": (
-                        reasoning_prompt_record["tokens"] if reasoning_prompt_record else None
-                    ),
-                    "answer_serialized_prompt": prompt,
-                    "answer_input_ids": answer_prompt_record["input_ids"],
-                    "answer_input_tokens": answer_prompt_record["tokens"],
-                    "runtime_tokenizer_template_fingerprint": runtime_tokenizer_fingerprint,
-                    "raw_reasoning": reasoning["raw_text"] if reasoning else None,
-                    "enforced_reasoning": enforced_by_id.get(row_id),
-                    "reasoning_completion": reasoning,
-                    "answer_completion": answer,
-                    "assistant_completion": assistant_completion,
-                    "model_choice": choice,
-                    "model_choice_surface": (
-                        answer_surfaces[choice] if choice is not None else None  # type: ignore[index]
-                    ),
-                    "model_choice_candidate": chosen_candidate,
-                    "model_choice_canonical": canonical_choice,
-                    "parse_compliance": choice is not None,
-                    "strict_answer_compliance": choice is not None,
-                    "zero_reasoning_compliance": (
-                        choice is not None if int(source["reasoning_budget"]) == 0 else None
-                    ),
-                    "posterior_correct": posterior_correct,
-                    "canonical_posterior_correct": canonical_posterior_correct,
-                    **score_record,
-                    "candidate_1_sequence_log_probability": candidate_1_sequence_score,
-                    "candidate_2_sequence_log_probability": candidate_2_sequence_score,
-                    "candidate_1_minus_candidate_2_logit": canonical_logit_difference,
-                    **capture_records.get(row_id, {}),
-                    "generation_settings": {
-                        "do_sample": False,
-                        "enable_thinking": False,
-                        "max_answer_tokens": config.max_answer_tokens,
-                        "max_reasoning_tokens": config.max_reasoning_tokens,
-                        **dict(config.generation_kwargs),
-                    },
-                }
-                completed[row_id] = record
-            answer_batch_index = start // answer_batch_size + 1
-            if (
-                answer_batch_index % config.checkpoint_every_batches == 0
-                or answer_batch_index == answer_batch_count
-            ):
-                ordered = [
-                    completed[str(row["row_id"])]
-                    for row in dataset
-                    if row["row_id"] in completed
-                ]
-                _atomic_write_text(
-                    results_path,
-                    "".join(
-                        json.dumps(row, ensure_ascii=False) + "\n" for row in ordered
-                    ),
-                )
+            completed[row_id] = record
+
+        ordered_checkpoint = [
+            completed[str(row["row_id"])]
+            for row in dataset
+            if str(row["row_id"]) in completed
+        ]
+        _atomic_write_text(
+            results_path,
+            "".join(
+                json.dumps(row, ensure_ascii=False) + "\n" for row in ordered_checkpoint
+            ),
+        )
 
         ordered_results = [
             completed[str(row["row_id"])] for row in dataset if row["row_id"] in completed
@@ -1273,6 +1811,7 @@ class QwenRunner:
                 "experiment_dir": str(root),
                 "capture": asdict(config.capture),
                 "metrics": asdict(config.metrics),
+                "completion_mtp": asdict(config.completion_mtp),
             },
             "effective_batch_sizes": self._effective_batch_sizes,
             "effective_capture_batch_sizes": self._effective_capture_batch_sizes,

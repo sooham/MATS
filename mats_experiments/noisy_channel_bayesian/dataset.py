@@ -273,7 +273,7 @@ def _probe_manifest(probe: XVsYPosteriorProbe) -> dict[str, object]:
         "x": probe.x,
         "y": probe.y,
         "allow_same": probe.allow_same,
-        "reasoning_budget": probe.reasoning_budget,
+        "reasoning": probe.reasoning,
         "call_layout": probe.call_layout,
         "answer_prefix": probe.answer_prefix,
     }
@@ -440,7 +440,7 @@ class TranscriptDatasetGenerator:
             "environments": environment_manifests,
             "questions": question_manifests,
             "probes": probe_manifests,
-            "reasoning_budgets": [probe.reasoning_budget for probe in probes],
+            "reasoning_values": [probe.reasoning for probe in probes],
             "parameterizations": parameterizations,
             "system_prompt": self.system_prompt.content,
             "tokenizer_template_fingerprint": self.tokenizer_binding.fingerprint,
@@ -463,8 +463,8 @@ class CandidateEvidenceDatasetGenerator:
     def generate(self, *, source_dataset: TranscriptDataset) -> TranscriptDataset:
         if not source_dataset:
             raise ValueError("source_dataset must not be empty.")
-        if self.probe.reasoning_budget != 0:
-            raise ValueError("The candidate-evidence control requires reasoning_budget=0.")
+        if self.probe.reasoning:
+            raise ValueError("The candidate-evidence control requires reasoning=False.")
         source_system_prompt = source_dataset.manifest.get("system_prompt")
         if source_system_prompt != self.system_prompt.content:
             raise ValueError("Reduced and raw datasets must use the same system prompt.")
@@ -518,7 +518,7 @@ class CandidateEvidenceDatasetGenerator:
                 "x": self.probe.x,
                 "y": self.probe.y,
                 "allow_same": self.probe.allow_same,
-                "reasoning_budget": self.probe.reasoning_budget,
+                "reasoning": self.probe.reasoning,
                 "call_layout": self.probe.call_layout,
                 "answer_prefix": self.probe.answer_prefix,
             },

@@ -14,6 +14,7 @@ from mats_experiments.noisy_channel_bayesian import (
     MetricSpec,
     NoisyChannelBayesianEnvironment,
     QwenRunner,
+    SGLangMTPConfig,
     TokenizerBinding,
     TranscriptDatasetGenerator,
     XVsYPosteriorProbe,
@@ -143,12 +144,12 @@ class FinalLogitOnlyFakeModel(FakeModel):
         return output
 
 
-def make_dataset(tmp_path: Path, *, reasoning_budget=3):
+def make_dataset(tmp_path: Path, *, reasoning: bool = False):
     tokenizer = FakeTokenizer()
     dataset = TranscriptDatasetGenerator(
         NoisyChannelBayesianEnvironment(n=2, k=1, r_values="3/4"),
         FixedSubsetQuestion([[1]]),
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=reasoning_budget),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=reasoning),
         TokenizerBinding(tokenizer),
     ).generate(num_question_sets=1)
     dataset.save(tmp_path)
@@ -164,7 +165,153 @@ def test_padding_is_removed_before_token_selection() -> None:
     assert selected[1].shape == (3, 2)
 
 
-def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("text", "reasoning", "leading", "trailing"),
+    [
+        ("ANSWER: 1\n", False, " ", "\n"),
+        ("work\nANSWER:\n 1\n", True, "\n ", "\n"),
+    ],
+)
+def test_completion_contract_treats_answer_whitespace_as_semantic_not_exact(
+    text: str, reasoning: bool, leading: str, trailing: str
+) -> None:
+    parsed = runner_module.parse_completion_contract(
+        text,
+        reasoning=reasoning,
+        allow_same=False,
+        x_surface="1",
+        y_surface="2",
+    )
+
+    assert parsed["model_choice"] == "X"
+    assert parsed["semantic_answer_compliance"] is True
+    assert parsed["strict_answer_compliance"] is True
+    assert parsed["exact_answer_format_compliance"] is False
+    assert parsed["answer_leading_whitespace"] == leading
+    assert parsed["answer_trailing_whitespace"] == trailing
+    assert parsed["answer_value_surface"] == "1"
+
+
+def test_reasoning_without_answer_marker_remains_a_compliance_failure() -> None:
+    parsed = runner_module.parse_completion_contract(
+        "reasoning that never finishes",
+        reasoning=True,
+        allow_same=False,
+        x_surface="1",
+        y_surface="2",
+    )
+
+    assert parsed["model_choice"] is None
+    assert parsed["semantic_answer_compliance"] is False
+    assert parsed["compliance_break"] == "missing_answer_marker"
+
+
+class WhitespaceTerminalAnswerFakeModel(FakeModel):
+    def __init__(self, *, reasoning: bool):
+        super().__init__()
+        self.reasoning = reasoning
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens, kwargs
+        self.generate_calls += 1
+        text = "work ANSWER: \n1\n" if self.reasoning else " \n1\n"
+        suffix = torch.tensor(
+            [self._encode(text) + [self.generation_config.eos_token_id]] * len(input_ids)
+        )
+        return torch.cat([input_ids, suffix], dim=1)
+
+    def forward(self, input_ids, attention_mask, use_cache=False):
+        del attention_mask, use_cache
+        logits = torch.zeros(*input_ids.shape, 300)
+        immediately_before_candidate = input_ids.eq(ord("\n") + 3)
+        logits[..., ord("1") + 3] = torch.where(
+            immediately_before_candidate, 9.0, 1.0
+        )
+        logits[..., ord("2") + 3] = torch.where(
+            immediately_before_candidate, 4.0, 8.0
+        )
+        return SimpleNamespace(logits=logits)
+
+    @staticmethod
+    def _encode(text: str) -> list[int]:
+        return [ord(character) + 3 for character in text]
+
+
+class DistinctAssistantEndFakeModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.generation_config.eos_token_id = 299
+        self.received_eos_token_ids: list[int] = []
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+        del attention_mask, max_new_tokens
+        self.generate_calls += 1
+        self.received_eos_token_ids = [int(value) for value in kwargs["eos_token_id"]]
+        suffix = torch.tensor(
+            [[ord("1") + 3, 2, ord("\n") + 3, 299]] * len(input_ids)
+        )
+        return torch.cat([input_ids, suffix], dim=1)
+
+
+def test_generation_stops_at_tokenizer_or_model_eos(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
+    model = DistinctAssistantEndFakeModel()
+    results = QwenRunner(
+        model=model, tokenizer=tokenizer, device=torch.device("cpu")
+    ).execute(
+        dataset,
+        ExecutionConfig(experiment_dir=tmp_path, run_id="assistant_end", batch_size=2),
+    )
+
+    assert set(model.received_eos_token_ids) == {2, 299}
+    assert all(row["generated_token_ids"] == tokenizer.encode("1") for row in results)
+    assert all(row["completion"]["terminal_stop_token_id"] == 2 for row in results)
+    assert all(row["completion"]["reached_eos"] is True for row in results)
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_logits_are_measured_after_whitespace_immediately_before_candidate(
+    tmp_path: Path, reasoning: bool
+) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=reasoning)
+    results = QwenRunner(
+        model=WhitespaceTerminalAnswerFakeModel(reasoning=reasoning),
+        tokenizer=tokenizer,
+        device=torch.device("cpu"),
+    ).execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id=f"whitespace_boundary_{reasoning}",
+            batch_size=2,
+            metrics=MetricSpec(sequence_scores=False),
+            capture=CaptureSpec(
+                logits_boundaries=("answer",),
+                logits_scope="answer_surfaces",
+            ),
+        ),
+    )
+
+    generated_prefix = "work ANSWER: \n" if reasoning else " \n"
+    for row in results:
+        assert row["semantic_answer_compliance"] is True
+        assert row["exact_answer_format_compliance"] is False
+        assert row["answer_leading_whitespace"] == " \n"
+        assert row["answer_trailing_whitespace"] == "\n"
+        assert row["answer_boundary_generated_token_count"] == len(
+            tokenizer.encode(generated_prefix)
+        )
+        assert row["answer_leading_whitespace_token_ids"] == tokenizer.encode(" \n")
+        assert row["answer_value_generated_token_ids"] == tokenizer.encode("1")
+        assert row["answer_trailing_whitespace_token_ids"] == tokenizer.encode("\n")
+        assert row["answer_surface_raw_logits"] == {"1": 9.0, "2": 4.0}
+        assert row["candidate_1_answer_surface"] == "1"
+        assert row["candidate_2_answer_surface"] == "2"
+        assert row["candidate_1_answer_token_ids"] == tokenizer.encode("1")
+        assert row["candidate_2_answer_token_ids"] == tokenizer.encode("2")
+
+
+def test_single_generation_teacher_forced_capture_scoring_and_resume(tmp_path: Path) -> None:
     dataset, tokenizer = make_dataset(tmp_path)
     model = FakeModel()
     runner = QwenRunner(model=model, tokenizer=tokenizer, device=torch.device("cpu"))
@@ -173,7 +320,7 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
         run_id="fake",
         batch_size=2,
         capture=CaptureSpec(
-            logits_boundaries=("reasoning", "answer"),
+            logits_boundaries=("answer",),
             streams=("resid_pre", "token_mixer_out", "mlp_out", "resid_post"),
             layers="all",
             tokens="last",
@@ -181,19 +328,27 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
     )
     results = runner.execute(dataset, config)
     assert len(results) == 2
-    assert model.generate_calls == 2
+    assert model.generate_calls == 1
     assert all(row["model_choice"] == "X" for row in results)
     assert all(row["model_choice_surface"] == "1" for row in results)
     assert all(row["assistant_completion"] == "ANSWER:1" for row in results)
     assert all(row["strict_answer_compliance"] is True for row in results)
-    assert all(row["answer_messages"][-1] == {
-        "role": "assistant", "content": "1\nANSWER:"
-    } for row in results)
+    assert all(row["generation_messages"][-1]["role"] == "user" for row in results)
     assert all(
-        row["answer_serialized_prompt"].endswith("<assistant>1\nANSWER:")
+        row["generation_messages"][-1]["content"].endswith("ANSWER:")
         for row in results
     )
-    assert all("Now provide only" not in row["answer_serialized_prompt"] for row in results)
+    assert all(
+        row["generation_serialized_prompt"].endswith("ANSWER:<assistant>")
+        for row in results
+    )
+    assert all(row["generated_token_ids"] == tokenizer.encode("1") for row in results)
+    assert all(row["full_completion"] == "ANSWER:1" for row in results)
+    assert all(
+        row["teacher_forced_input_ids"]
+        == row["generation_input_ids"] + row["generated_sequence_token_ids"]
+        for row in results
+    )
     assert all(row["answer_surfaces"]["X"] == "1" for row in results)
     assert all(row["answer_surfaces"]["Y"] == "2" for row in results)
     assert all(row["answer_surface_token_ids"]["X"] == [ord("1") + 3] for row in results)
@@ -206,13 +361,13 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
         for row in results
     )
     assert all(row["x_minus_y_logit"] == pytest.approx(2) for row in results)
-    assert all(len(row["enforced_reasoning"].split()) <= 3 for row in results)
-    assert all(row["reasoning_serialized_prompt"] for row in results)
-    assert all(row["reasoning_input_ids"] for row in results)
-    assert all(row["reasoning_input_tokens"] for row in results)
-    assert all(row["answer_input_ids"] == tokenizer.encode(row["answer_serialized_prompt"]) for row in results)
+    assert all(
+        row["answer_boundary_source"] == "assistant_role_after_user_marker"
+        for row in results
+    )
+    assert all(row["answer_boundary_generated_token_count"] == 0 for row in results)
     tensors = load_file(tmp_path / "runs/fake/activations" / f"{results[0]['row_id']}.safetensors")
-    assert "reasoning.resid_pre.layer_0" in tensors
+    assert "answer.resid_pre.layer_0" in tensors
     assert "answer.resid_post.layer_1" in tensors
     logits = load_file(tmp_path / "runs/fake/logits" / f"{results[0]['row_id']}.safetensors")
     assert logits["answer.logits"].shape == (300,)
@@ -230,7 +385,7 @@ def test_batched_multistage_capture_scoring_and_resume(tmp_path: Path) -> None:
 
     resumed = runner.execute(dataset, config)
     assert len(resumed) == 2
-    assert model.generate_calls == 2
+    assert model.generate_calls == 1
 
 
 def test_runner_executes_mixed_reasoning_probe_parameterizations(tmp_path: Path) -> None:
@@ -241,8 +396,8 @@ def test_runner_executes_mixed_reasoning_probe_parameterizations(tmp_path: Path)
         ),
         FixedSubsetQuestion([[1]]),
         (
-            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
-            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=3),
+            XVsYPosteriorProbe(x=1, y=2, reasoning=False),
+            XVsYPosteriorProbe(x=1, y=2, reasoning=True),
         ),
         TokenizerBinding(tokenizer),
     ).generate(num_question_sets=1)
@@ -250,24 +405,83 @@ def test_runner_executes_mixed_reasoning_probe_parameterizations(tmp_path: Path)
         model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
     ).execute(
         dataset,
-        ExecutionConfig(experiment_dir=tmp_path, run_id="mixed_budgets", batch_size=4),
+        ExecutionConfig(experiment_dir=tmp_path, run_id="mixed_reasoning", batch_size=4),
     )
 
     assert len(results) == 8
-    zero_budget = [row for row in results if row["reasoning_budget"] == 0]
-    positive_budget = [row for row in results if row["reasoning_budget"] == 3]
-    assert len(zero_budget) == len(positive_budget) == 4
-    assert all(row["answer_messages"][-1]["content"] == "ANSWER:" for row in zero_budget)
-    assert all(
-        row["answer_messages"][-1]["content"] == "1\nANSWER:"
-        for row in positive_budget
+    reasoning_off = [row for row in results if row["reasoning"] is False]
+    reasoning_on = [row for row in results if row["reasoning"] is True]
+    assert len(reasoning_off) == len(reasoning_on) == 4
+    assert all(row["full_completion"] == "ANSWER:1" for row in reasoning_off)
+    assert all(row["strict_answer_compliance"] is True for row in reasoning_off)
+    assert all(row["full_completion"] == "1" for row in reasoning_on)
+    assert all(row["strict_answer_compliance"] is False for row in reasoning_on)
+    assert all(row["compliance_break"] == "missing_answer_marker" for row in reasoning_on)
+    assert all(row["answer_boundary_generated_token_count"] is None for row in reasoning_on)
+
+
+def test_runner_routes_all_continuous_completions_through_sglang_mtp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizer = FakeTokenizer()
+    dataset = TranscriptDatasetGenerator(
+        NoisyChannelBayesianEnvironment(n=2, k=1, r_values="3/4"),
+        FixedSubsetQuestion([[1]]),
+        (
+            XVsYPosteriorProbe(x=1, y=2, reasoning=False),
+            XVsYPosteriorProbe(x=1, y=2, reasoning=True),
+        ),
+        TokenizerBinding(tokenizer),
+    ).generate(num_question_sets=1)
+    dataset.save(tmp_path)
+    model = FakeModel()
+    runner = QwenRunner(model=model, tokenizer=tokenizer, device=torch.device("cpu"))
+    calls = []
+
+    def fake_mtp(items, *, batch_size, max_new_tokens, generation_kwargs, config):
+        calls.append((items, batch_size, max_new_tokens, generation_kwargs, config))
+        runner._generation_backend_metadata = {
+            "backend": "sglang_native_mtp",
+            "algorithm": "NEXTN",
+        }
+        results = {}
+        for row_id, prompt in items:
+            text = "1" if "ANSWER:<assistant>" in prompt else "work ANSWER:1"
+            results[row_id] = {
+                "text": text,
+                "token_ids": tokenizer.encode(text),
+                "completion_length": len(tokenizer.encode(text)),
+                "reached_eos": False,
+                "hit_token_cap": False,
+                "effective_batch_size": len(items),
+                "generation_backend": "sglang_native_mtp",
+                "mtp_metrics": {"spec_accept_rate": 1.0},
+            }
+        return results
+
+    monkeypatch.setattr(runner, "_generate_completion_with_sglang_mtp", fake_mtp)
+    results = runner.execute(
+        dataset,
+        ExecutionConfig(
+            experiment_dir=tmp_path,
+            run_id="mtp_continuous",
+            batch_size=2,
+            completion_mtp=SGLangMTPConfig(enabled=True),
+        ),
     )
-    assert all(
-        row["answer_messages"][-1]["role"] == "assistant"
-        and "Now provide only" not in row["answer_serialized_prompt"]
-        for row in positive_budget
-    )
+
+    assert len(calls) == 1
+    assert len(calls[0][0]) == len(dataset)
+    assert model.generate_calls == 0
     assert all(row["strict_answer_compliance"] is True for row in results)
+    assert all(
+        row["completion"]["generation_backend"] == "sglang_native_mtp"
+        for row in results
+    )
+    assert all(
+        row["generation_settings"]["generation_backend"]["algorithm"] == "NEXTN"
+        for row in results
+    )
 
 
 def test_runner_reorients_positional_metrics_to_canonical_candidates(tmp_path: Path) -> None:
@@ -277,7 +491,7 @@ def test_runner_reorients_positional_metrics_to_canonical_candidates(tmp_path: P
             n=2, k=1, r_values="3/4", control_positional_bias=True
         ),
         FixedSubsetQuestion([[1]]),
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=False),
         TokenizerBinding(tokenizer),
     ).generate(num_question_sets=1)
     results = QwenRunner(
@@ -297,6 +511,14 @@ def test_runner_reorients_positional_metrics_to_canonical_candidates(tmp_path: P
     assert all(row["candidate_2_sequence_log_probability"] == pytest.approx(
         row["sequence_log_probabilities"]["2"]
     ) for row in results)
+    assert all(row["candidate_1_answer_surface"] == "1" for row in results)
+    assert all(row["candidate_2_answer_surface"] == "2" for row in results)
+    assert all(
+        row["candidate_1_answer_token_ids"] == tokenizer.encode("1") for row in results
+    )
+    assert all(
+        row["candidate_2_answer_token_ids"] == tokenizer.encode("2") for row in results
+    )
     assert all(row["candidate_1_minus_candidate_2_logit"] == pytest.approx(2) for row in results)
     for pattern_index in range(2):
         first, second = results[pattern_index * 2 : pattern_index * 2 + 2]
@@ -305,7 +527,7 @@ def test_runner_reorients_positional_metrics_to_canonical_candidates(tmp_path: P
 
 
 def test_oom_recursively_splits_batches(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     model = FakeModel(oom_batches=True)
     runner = QwenRunner(model=model, tokenizer=tokenizer, device=torch.device("cpu"))
     results = runner.execute(
@@ -320,7 +542,7 @@ def test_oom_recursively_splits_batches(tmp_path: Path) -> None:
 def test_answer_surface_logits_reuse_generation_without_capture_forward(
     tmp_path: Path,
 ) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     model = GenerateLogitsFakeModel()
     results = QwenRunner(
         model=model, tokenizer=tokenizer, device=torch.device("cpu")
@@ -339,7 +561,8 @@ def test_answer_surface_logits_reuse_generation_without_capture_forward(
     )
 
     assert model.generate_calls == 1
-    assert model.forward_calls == 0
+    # Boundary capture is teacher-forced over the exact emitted sequence.
+    assert model.forward_calls == 1
     assert all("logit_path" not in row for row in results)
     for row in results:
         assert row["answer_surface_raw_logits"] == {"1": 3.0, "2": 1.0}
@@ -350,7 +573,7 @@ def test_answer_surface_logits_reuse_generation_without_capture_forward(
 
 
 def test_boundary_capture_projects_only_final_prompt_position(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     model = FinalLogitOnlyFakeModel()
     results = QwenRunner(
         model=model, tokenizer=tokenizer, device=torch.device("cpu")
@@ -365,7 +588,7 @@ def test_boundary_capture_projects_only_final_prompt_position(tmp_path: Path) ->
         ),
     )
 
-    assert model.logits_to_keep_calls == [1]
+    assert model.logits_to_keep_calls == [0]
     logits = load_file(
         tmp_path / "runs/final_logits/logits" / f"{results[0]['row_id']}.safetensors"
     )
@@ -379,7 +602,7 @@ def test_results_checkpoint_is_periodic_not_per_minibatch(
     dataset = TranscriptDatasetGenerator(
         NoisyChannelBayesianEnvironment(n=2, k=3, r_values="3/4"),
         FixedSubsetQuestion([[1], [2], [1]]),
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=False),
         TokenizerBinding(tokenizer),
     ).generate(num_question_sets=1)
     dataset.save(tmp_path)
@@ -406,11 +629,11 @@ def test_results_checkpoint_is_periodic_not_per_minibatch(
     )
 
     assert len(results) == 8
-    assert len(results_writes) == 2
+    assert len(results_writes) == 1
 
 
 def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     runner = QwenRunner(model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu"))
     results = runner.execute(
         dataset,
@@ -427,17 +650,17 @@ def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
         ),
     )
     tensors = load_file(tmp_path / "runs/decode/logits" / f"{results[0]['row_id']}.safetensors")
-    assert tensors["answer.logits"].shape == (1, 300)
+    assert tensors["answer.logits"].shape == (300,)
     activations = load_file(
         tmp_path / "runs/decode/activations" / f"{results[0]['row_id']}.safetensors"
     )
     for stream in ("resid_pre", "token_mixer_out", "mlp_out", "resid_post"):
         for layer in range(2):
-            assert activations[f"answer.{stream}.layer_{layer}"].shape == (1, 4)
+            assert activations[f"answer.{stream}.layer_{layer}"].shape == (2, 4)
 
 
 def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     runner = QwenRunner(model=FakeModel(), tokenizer=tokenizer, device=torch.device("cpu"))
     results = runner.execute(
         dataset,
@@ -460,20 +683,17 @@ def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> Non
             tmp_path / "runs/all_prompt_tokens/activations" / f"{row['row_id']}.safetensors"
         )
         assert activations["answer.resid_pre.layer_0"].shape == (
-            len(row["answer_input_ids"]),
+            len(row["teacher_forced_input_ids"]),
             4,
         )
         assert activations["answer.token_mixer_out.layer_1"].shape == (
-            len(row["answer_input_ids"]),
+            len(row["teacher_forced_input_ids"]),
             4,
         )
         logits = load_file(
             tmp_path / "runs/all_prompt_tokens/logits" / f"{row['row_id']}.safetensors"
         )
-        assert logits["answer.logits"].shape == (
-            len(row["answer_input_ids"]),
-            300,
-        )
+        assert logits["answer.logits"].shape == (300,)
 
 
 class ConstructionOnlyTokenizer(FakeTokenizer):
@@ -497,7 +717,7 @@ def test_runner_reserializes_with_runtime_tokenizer_and_persists_exact_tokens(
     dataset = TranscriptDatasetGenerator(
         NoisyChannelBayesianEnvironment(n=2, k=1, r_values="3/4"),
         FixedSubsetQuestion([[1]]),
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=False),
         TokenizerBinding(construction_tokenizer),
     ).generate(num_question_sets=1)
     dataset.save(tmp_path)
@@ -511,13 +731,13 @@ def test_runner_reserializes_with_runtime_tokenizer_and_persists_exact_tokens(
 
     assert result["serialized_prompt"].startswith("[system]") is False
     assert result["serialized_prompt"].startswith("[user]")
-    assert result["answer_serialized_prompt"].startswith("<user>")
-    assert result["answer_serialized_prompt"] != result["serialized_prompt"]
-    assert result["answer_input_ids"] == runtime_tokenizer.encode(
-        result["answer_serialized_prompt"]
+    assert result["generation_serialized_prompt"].startswith("<user>")
+    assert result["generation_serialized_prompt"] != result["serialized_prompt"]
+    assert result["generation_input_ids"] == runtime_tokenizer.encode(
+        result["generation_serialized_prompt"]
     )
     assert "The decision value must be exactly one of: 1 or 2." in result[
-        "answer_serialized_prompt"
+        "generation_serialized_prompt"
     ]
     assert result["runtime_tokenizer_template_fingerprint"] != result[
         "tokenizer_template_fingerprint"
@@ -563,8 +783,8 @@ class VerboseAnswerFakeModel(FakeModel):
         return torch.cat([input_ids, suffix], dim=1)
 
 
-def test_zero_budget_rejects_an_explanatory_answer(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=0)
+def test_reasoning_off_rejects_an_explanatory_answer(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=False)
     results = QwenRunner(
         model=VerboseAnswerFakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
     ).execute(
@@ -574,14 +794,14 @@ def test_zero_budget_rejects_an_explanatory_answer(tmp_path: Path) -> None:
     assert all(row["assistant_completion"] == "ANSWER:1 because" for row in results)
     assert all(row["model_choice"] is None for row in results)
     assert all(row["strict_answer_compliance"] is False for row in results)
-    assert all(row["zero_reasoning_compliance"] is False for row in results)
+    assert all(row["no_reasoning_compliance"] is False for row in results)
 
 
 class ReasonThenSameFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
-        text = "brief work" if self.generate_calls == 1 else "SAME"
+        text = "brief work ANSWER:SAME"
         suffix = torch.tensor(
             [[ord(character) + 3 for character in text] + [2]] * len(input_ids)
         )
@@ -599,7 +819,7 @@ def test_allow_same_with_reasoning_works_for_both_layouts(
         XVsYPosteriorProbe(
             x=1,
             y=2,
-            reasoning_budget=3,
+            reasoning=True,
             allow_same=True,
             call_layout=call_layout,
         ),
@@ -619,7 +839,7 @@ def test_allow_same_with_reasoning_works_for_both_layouts(
     assert all(row["normative_comparison"] == "SAME" for row in results)
     assert all(row["ground_truth_choice"] == "SAME" for row in results)
     assert all(row["model_choice"] == "SAME" for row in results)
-    assert all(row["assistant_completion"] == "ANSWER:SAME" for row in results)
+    assert all(row["assistant_completion"] == "brief work ANSWER:SAME" for row in results)
     assert all(row["strict_answer_compliance"] is True for row in results)
     assert all(row["posterior_correct"] is True for row in results)
     assert all(row["call_layout"] == call_layout for row in results)
@@ -629,7 +849,7 @@ class ThinkingMarkerFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
-        text = "<think>visible reasoning</think>" if self.generate_calls == 1 else "1"
+        text = "<think>visible reasoning</think> ANSWER:1"
         suffix = torch.tensor([self._encode(text) + [2]] * len(input_ids))
         return torch.cat([input_ids, suffix], dim=1)
 
@@ -638,16 +858,19 @@ class ThinkingMarkerFakeModel(FakeModel):
         return [ord(character) + 3 for character in text]
 
 
-def test_reasoning_completion_removes_stray_native_thinking_markers(tmp_path: Path) -> None:
-    dataset, tokenizer = make_dataset(tmp_path, reasoning_budget=3)
+def test_reasoning_completion_is_stored_without_repair(tmp_path: Path) -> None:
+    dataset, tokenizer = make_dataset(tmp_path, reasoning=True)
     result = QwenRunner(
         model=ThinkingMarkerFakeModel(), tokenizer=tokenizer, device=torch.device("cpu")
     ).execute(
         dataset,
         ExecutionConfig(experiment_dir=tmp_path, run_id="thinking_markers", batch_size=2),
     )[0]
-    assert result["reasoning_completion"]["text"] == "visible reasoning"
-    assert result["reasoning_completion"]["raw_text"] == "<think>visible reasoning</think>"
-    assert result["reasoning_completion"]["thinking_markers_removed"] is True
-    assert "<think>" not in result["enforced_reasoning"]
+    assert result["completion"]["text"] == "<think>visible reasoning</think> ANSWER:1"
+    assert result["full_completion"] == "<think>visible reasoning</think> ANSWER:1"
+    assert result["generated_token_ids"] == result["completion"]["token_ids"]
+    assert result["strict_answer_compliance"] is True
+    assert result["reasoning_length_tokens"] == len(
+        tokenizer.encode("<think>visible reasoning</think> ANSWER:")
+    )
     assert result["generation_settings"]["enable_thinking"] is False

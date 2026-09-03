@@ -21,13 +21,10 @@ from mats_experiments.noisy_channel_bayesian import (
     TranscriptDataset,
     TranscriptDatasetGenerator,
     XVsYPosteriorProbe,
-    enforce_reasoning,
     exact_bayesian_target,
     exact_pattern_mass,
     natural_log_ratio,
     resolve_selector,
-    stage_two_messages,
-    strip_thinking_markers,
     summarize_representation_control,
 )
 
@@ -138,8 +135,8 @@ def test_generator_parameter_axes_form_a_cartesian_product() -> None:
     )
     questions = (FixedSubsetQuestion([[1]]), FixedSubsetQuestion([[2]]))
     probes = (
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=0),
-        XVsYPosteriorProbe(x=1, y=2, reasoning_budget=10),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=False),
+        XVsYPosteriorProbe(x=1, y=2, reasoning=True),
     )
     dataset = TranscriptDatasetGenerator(
         environment=environments,
@@ -155,7 +152,7 @@ def test_generator_parameter_axes_form_a_cartesian_product() -> None:
     assert dataset.manifest["environment_parameter_count"] == 2
     assert dataset.manifest["question_parameter_count"] == 2
     assert dataset.manifest["probe_parameter_count"] == 2
-    assert dataset.manifest["reasoning_budgets"] == [0, 10]
+    assert dataset.manifest["reasoning_values"] == [False, True]
     assert dataset.manifest["rows_per_question_set"] == len(dataset)
     assert {
         (
@@ -168,26 +165,25 @@ def test_generator_parameter_axes_form_a_cartesian_product() -> None:
           for question in range(2) for probe in range(2)}
 
 
-def test_reasoning_probe_sweep_reuses_one_question_bank() -> None:
-    budgets = tuple(range(0, 200, 10))
+def test_reasoning_probe_variants_reuse_one_question_bank() -> None:
+    reasoning_values = (False, True)
     dataset = TranscriptDatasetGenerator(
         environment=NoisyChannelBayesianEnvironment(
             n=2, k=1, r_values="3/4", control_positional_bias=True
         ),
         question=FixedSubsetQuestion([[1]]),
         probe=tuple(
-            XVsYPosteriorProbe(x=1, y=2, reasoning_budget=budget)
-            for budget in budgets
+            XVsYPosteriorProbe(x=1, y=2, reasoning=reasoning)
+            for reasoning in reasoning_values
         ),
         tokenizer_binding=TokenizerBinding(TinyTokenizer()),
     ).generate(num_question_sets=1)
 
-    assert len(budgets) == 20
-    assert len(dataset) == 20 * 2 * 1 * 2
-    assert dataset.manifest["reasoning_budgets"] == list(budgets)
+    assert len(dataset) == 2 * 2 * 1 * 2
+    assert dataset.manifest["reasoning_values"] == list(reasoning_values)
     assert all(
-        sum(row["reasoning_budget"] == budget for row in dataset) == 4
-        for budget in budgets
+        sum(row["reasoning"] is reasoning for row in dataset) == 4
+        for reasoning in reasoning_values
     )
     assert len({
         tuple(tuple(values) for values in row["membership_sets"])
@@ -291,22 +287,7 @@ def test_fixed_and_random_subset_validation_and_replacement() -> None:
     assert sampled["membership_set"] == list(dict.fromkeys(sampled["raw_draws"]))
 
 
-def test_multistage_layouts_word_cap_and_ties() -> None:
-    assert enforce_reasoning("one two three ANSWER: X", 2) == "one two"
-    assert strip_thinking_markers("\n<think>\none two\n</think>\n") == "one two"
-    assert enforce_reasoning("<think>one two three</think>", 2) == "one two"
-    base = [{"role": "user", "content": "REASONING:"}]
-    conversation = stage_two_messages(
-        first_messages=base, enforced_reasoning="work", layout="conversation"
-    )
-    assert [message["role"] for message in conversation] == ["user", "assistant"]
-    assert conversation[-1]["content"] == "work\nANSWER:"
-    replay = stage_two_messages(
-        first_messages=base, enforced_reasoning="work", layout="replay_user"
-    )
-    assert [message["role"] for message in replay] == ["user", "assistant"]
-    assert replay[-1]["content"] == "work\nANSWER:"
-
+def test_reasoning_toggle_and_ties() -> None:
     tied = generator(
         environment=NoisyChannelBayesianEnvironment(n=2, k=1, r_values=Fraction(1, 2)),
         question=FixedSubsetQuestion([[1]]),
@@ -314,6 +295,12 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
     ).generate(num_question_sets=1)
     assert all(row["normative_comparison"] == "SAME" for row in tied)
     assert all(row["ground_truth_choice"] is None for row in tied)
+    assert all(
+        "If the two posterior probabilities are equal, output either 1 or 2; "
+        "either value is valid."
+        in row["messages"][-1]["content"]
+        for row in tied
+    )
 
     same_allowed = generator(
         environment=NoisyChannelBayesianEnvironment(n=2, k=1, r_values=Fraction(1, 2)),
@@ -328,12 +315,12 @@ def test_multistage_layouts_word_cap_and_ties() -> None:
     )
 
 
-@pytest.mark.parametrize("reasoning_budget", [0, 12])
-def test_probe_values_are_the_model_facing_answer_surfaces(reasoning_budget: int) -> None:
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_probe_values_are_the_model_facing_answer_surfaces(reasoning: bool) -> None:
     dataset = generator(
         environment=NoisyChannelBayesianEnvironment(n=8, k=1, r_values="3/4"),
         question=FixedSubsetQuestion([[2, 4, 7]]),
-        probe=XVsYPosteriorProbe(x=2, y=7, reasoning_budget=reasoning_budget),
+        probe=XVsYPosteriorProbe(x=2, y=7, reasoning=reasoning),
     ).generate(num_question_sets=1)
     prompt = dataset[0]["messages"][-1]["content"]
     assert "A secret integer s was sampled uniformly from the displayed domain." in prompt
@@ -341,17 +328,16 @@ def test_probe_values_are_the_model_facing_answer_surfaces(reasoning_budget: int
     assert "displayed set contents are not evidence about s" in prompt
     assert "The decision value must be exactly one of: 2 or 7." in prompt
     assert "where X means" not in prompt
-    if reasoning_budget:
+    assert "Compare only candidates 2 and 7." in prompt
+    assert "The permitted values are 2, 7." in prompt
+    assert " | " not in prompt
+    if reasoning:
         assert "Reason carefully from the raw observations" in prompt
-        assert "output exactly one of: ANSWER:2 | ANSWER:7" in prompt
-        assert "ANSWER:SAME" not in prompt
         assert "Do not provide reasoning" not in prompt
-        assert prompt.endswith("REASONING:")
+        assert prompt.endswith("REASONING:\n")
     else:
         assert "Do not provide reasoning, explanation, calculations" in prompt
-        assert "Output exactly one of: ANSWER:2 | ANSWER:7." in prompt
-        assert "Your entire assistant response must be that allowed response" in prompt
-        assert not prompt.endswith("ANSWER:")
+        assert prompt.endswith("ANSWER:")
     assert dataset[0]["answer_prefix"] == "ANSWER:"
 
     resolved = MetricSpec().resolve(x=2, y=7)
@@ -364,7 +350,7 @@ def test_candidate_evidence_projection_is_exact_paired_and_set_free(
     raw_environment = NoisyChannelBayesianEnvironment(
         n=8, k=2, r_values=(Fraction(19, 20), Fraction(3, 5))
     )
-    probe = XVsYPosteriorProbe(x=2, y=7, reasoning_budget=0)
+    probe = XVsYPosteriorProbe(x=2, y=7, reasoning=False)
     raw = generator(
         environment=raw_environment,
         question=FixedSubsetQuestion([[2, 4], [2, 7]]),

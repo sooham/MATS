@@ -12,7 +12,6 @@ import itertools
 import json
 import math
 import random
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -187,7 +186,7 @@ CallLayout = Literal["conversation", "replay_user"]
 class XVsYPosteriorProbe:
     x: int = 2
     y: int = 7
-    reasoning_budget: int = 0
+    reasoning: bool = False
     allow_same: bool = False
     call_layout: CallLayout = "conversation"
     answer_prefix: str = "ANSWER:"
@@ -197,8 +196,8 @@ class XVsYPosteriorProbe:
             raise ValueError("x and y must be distinct; allow_same only controls tie answers.")
         if self.x not in range(1, n + 1) or self.y not in range(1, n + 1):
             raise ValueError(f"x and y must both lie in 1..{n}.")
-        if self.reasoning_budget < 0:
-            raise ValueError("reasoning_budget must be non-negative.")
+        if not isinstance(self.reasoning, bool):
+            raise TypeError("reasoning must be a bool.")
         if self.call_layout not in ("conversation", "replay_user"):
             raise ValueError("call_layout must be 'conversation' or 'replay_user'.")
         if (
@@ -553,21 +552,36 @@ def render_observable_prompt(
         lines.append(
             "If the two posterior probabilities are equal, the required decision value is SAME."
         )
+    else:
+        lines.append(
+            f"If the two posterior probabilities are equal, output either {probe.x} or "
+            f"{probe.y}; either value is valid."
+        )
     allowed_values = [str(probe.x), str(probe.y)] + (["SAME"] if probe.allow_same else [])
-    allowed_responses = " | ".join(
-        f"{probe.answer_prefix}{value}" for value in allowed_values
+    permitted_values = ", ".join(allowed_values)
+    reliability_name = "r" if shared_reliability else "r_i"
+    lines.extend(
+        [
+            (
+                f"Compare only candidates {probe.x} and {probe.y}. For each report, use "
+                f"probability {reliability_name} when the candidate's truthful answer matches "
+                f"the report and 1-{reliability_name} otherwise."
+            ),
+            (
+                f"After {probe.answer_prefix}, emit exactly one value token based on posterior "
+                "probability."
+            ),
+            f"The permitted values are {permitted_values}.",
+        ]
     )
     if stage == "reasoning":
         lines.extend(
             [
+                "Reason carefully from the raw observations and the stated channel rules.",
                 (
-                    "Reason carefully from the raw observations and the stated channel rules. "
-                    f"Keep the explanation at most {probe.reasoning_budget} words."
-                ),
-                (
-                    f"When asked for the final answer, output exactly one of: "
-                    f"{allowed_responses}. Do not include any other text in the answer, and do "
-                    "not insert whitespace after the answer prefix."
+                    f"Finish with {probe.answer_prefix} immediately followed by one permitted "
+                    "value. Do not put whitespace after the answer prefix or add text after "
+                    "the value."
                 ),
                 "REASONING:",
             ]
@@ -577,13 +591,14 @@ def render_observable_prompt(
             [
                 "Do not provide reasoning, explanation, calculations, or intermediate work.",
                 (
-                    f"Output exactly one of: {allowed_responses}. Your entire assistant "
-                    "response must be that allowed response with no other words or punctuation. "
-                    "Do not insert whitespace after the answer prefix."
+                    "The value must be the entire completion: no other words, whitespace, "
+                    "markup, or punctuation."
                 ),
+                probe.answer_prefix,
             ]
         )
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    return rendered + ("\n" if stage == "reasoning" else "")
 
 
 def initial_messages(
@@ -594,64 +609,6 @@ def initial_messages(
         messages.append({"role": "system", "content": system_prompt.content})
     messages.append({"role": "user", "content": observable_prompt})
     return messages
-
-
-def strip_thinking_markers(text: str) -> str:
-    """Remove Qwen-native think delimiters from a visible reasoning completion."""
-
-    return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
-
-
-def enforce_reasoning(text: str, budget: int) -> str:
-    """Remove a generated answer tail and enforce a whitespace-delimited word cap."""
-
-    if budget <= 0:
-        return ""
-    text = strip_thinking_markers(text)
-    # A model may anticipate the next stage.  Anything from that marker onward is discarded.
-    upper = text.upper()
-    marker = upper.find("ANSWER:")
-    if marker >= 0:
-        text = text[:marker]
-    return " ".join(text.strip().split()[:budget])
-
-
-def stage_two_messages(
-    *,
-    first_messages: Sequence[Mapping[str, str]],
-    enforced_reasoning: str,
-    layout: CallLayout,
-    answer_prefix: str = "ANSWER:",
-) -> list[dict[str, str]]:
-    """Build a continued-assistant prefill containing reasoning then the answer marker.
-
-    The generated reasoning is fixed context for the answer call. Keeping it and
-    ``answer_prefix`` in the same final assistant message guarantees that the logits
-    at the answer boundary are measured immediately after ``ANSWER:``, without an
-    intervening user turn.
-    """
-
-    if not first_messages:
-        raise ValueError("first_messages must not be empty.")
-    if not answer_prefix or answer_prefix != answer_prefix.strip() or "\n" in answer_prefix:
-        raise ValueError(
-            "answer_prefix must be non-empty, single-line, and have no surrounding whitespace."
-        )
-    assistant_prefill = f"{enforced_reasoning.rstrip()}\n{answer_prefix}"
-    if layout == "conversation":
-        return [
-            *(dict(message) for message in first_messages),
-            {"role": "assistant", "content": assistant_prefill},
-        ]
-    if layout == "replay_user":
-        system = [dict(message) for message in first_messages if message["role"] == "system"]
-        user = next(message["content"] for message in first_messages if message["role"] == "user")
-        return [
-            *system,
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assistant_prefill},
-        ]
-    raise ValueError(f"Unknown call layout {layout!r}.")
 
 
 @dataclass(frozen=True)
@@ -673,9 +630,8 @@ class CaptureSpec:
     every_decode_position: bool = False
 
     def __post_init__(self) -> None:
-        valid_boundaries = {"reasoning", "answer"}
-        if not set(self.logits_boundaries) <= valid_boundaries:
-            raise ValueError("logits_boundaries may contain only 'reasoning' and 'answer'.")
+        if not set(self.logits_boundaries) <= {"answer"}:
+            raise ValueError("logits_boundaries may contain only 'answer'.")
         if self.logits_scope not in {"full", "answer_surfaces"}:
             raise ValueError("logits_scope must be 'full' or 'answer_surfaces'.")
         valid_streams = {"resid_pre", "token_mixer_out", "mlp_out", "resid_post"}
@@ -853,8 +809,8 @@ def build_candidate_evidence_row(
     if list(source_row["domain"]) != list(environment.domain):  # type: ignore[arg-type]
         raise ValueError("Source row domain does not match the environment.")
     probe.validate(environment.n)
-    if probe.reasoning_budget != 0:
-        raise ValueError("The candidate-evidence control requires reasoning_budget=0.")
+    if probe.reasoning:
+        raise ValueError("The candidate-evidence control requires reasoning=False.")
     for key, expected in (("x", probe.x), ("y", probe.y)):
         if int(source_row[key]) != expected:
             raise ValueError(f"Source row {key} does not match the reduced probe.")
@@ -937,7 +893,7 @@ def build_candidate_evidence_row(
             "x": probe.x,
             "y": probe.y,
             "allow_same": probe.allow_same,
-            "reasoning_budget": probe.reasoning_budget,
+            "reasoning": probe.reasoning,
             "call_layout": probe.call_layout,
             "answer_prefix": probe.answer_prefix,
         },
@@ -976,7 +932,7 @@ def build_candidate_evidence_row(
         "x": probe.x,
         "y": probe.y,
         "allow_same": probe.allow_same,
-        "reasoning_budget": probe.reasoning_budget,
+        "reasoning": probe.reasoning,
         "call_layout": probe.call_layout,
         "answer_prefix": probe.answer_prefix,
         "candidate_evidence": candidate_evidence,
@@ -1046,7 +1002,7 @@ def build_row(
     candidate_2 = canonical_probe.y
     if {probe.x, probe.y} != {candidate_1, candidate_2}:
         raise ValueError("Presented probe candidates must match canonical C1/C2 candidates.")
-    for field_name in ("allow_same", "reasoning_budget", "call_layout", "answer_prefix"):
+    for field_name in ("allow_same", "reasoning", "call_layout", "answer_prefix"):
         if getattr(probe, field_name) != getattr(canonical_probe, field_name):
             raise ValueError(f"Presented and canonical probes disagree on {field_name}.")
     presentation_count = 2 if environment.control_positional_bias else 1
@@ -1069,7 +1025,7 @@ def build_row(
         reports=reports,
         reliabilities=environment.reliabilities,
     )
-    stage = "reasoning" if probe.reasoning_budget > 0 else "answer"
+    stage = "reasoning" if probe.reasoning else "answer"
     observable = render_observable_prompt(
         n=environment.n,
         questions=questions,
@@ -1094,7 +1050,7 @@ def build_row(
         "candidate_1": candidate_1,
         "candidate_2": candidate_2,
         "allow_same": canonical_probe.allow_same,
-        "reasoning_budget": canonical_probe.reasoning_budget,
+        "reasoning": canonical_probe.reasoning,
         "call_layout": canonical_probe.call_layout,
         "answer_prefix": canonical_probe.answer_prefix,
         "system_prompt": system_prompt.content,
@@ -1116,7 +1072,7 @@ def build_row(
         "x": probe.x,
         "y": probe.y,
         "allow_same": probe.allow_same,
-        "reasoning_budget": probe.reasoning_budget,
+        "reasoning": probe.reasoning,
         "call_layout": probe.call_layout,
         "answer_prefix": probe.answer_prefix,
         "system_prompt": system_prompt.content,
@@ -1157,7 +1113,7 @@ def build_row(
         "x": probe.x,
         "y": probe.y,
         "allow_same": probe.allow_same,
-        "reasoning_budget": probe.reasoning_budget,
+        "reasoning": probe.reasoning,
         "call_layout": probe.call_layout,
         "answer_prefix": probe.answer_prefix,
         "messages": messages,
