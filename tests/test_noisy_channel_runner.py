@@ -103,8 +103,15 @@ class FakeModel(nn.Module):
         self.generate_calls += 1
         if self.oom_batches and len(input_ids) > 1:
             raise RuntimeError("CUDA out of memory")
-        suffix = torch.tensor([[ord("1") + 3, 2]] * len(input_ids))
+        suffix = torch.tensor(
+            [self.encode_answer("1") + [self.generation_config.eos_token_id]]
+            * len(input_ids)
+        )
         return torch.cat([input_ids, suffix], dim=1)
+
+    @staticmethod
+    def encode_answer(value: str) -> list[int]:
+        return [ord(character) + 3 for character in f"ANSWER: {value}"]
 
 
 class GenerateLogitsFakeModel(FakeModel):
@@ -119,7 +126,10 @@ class GenerateLogitsFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens
         self.generate_calls += 1
-        suffix = torch.tensor([[ord("1") + 3, 2]] * len(input_ids))
+        suffix = torch.tensor(
+            [self.encode_answer("1") + [self.generation_config.eos_token_id]]
+            * len(input_ids)
+        )
         sequences = torch.cat([input_ids, suffix], dim=1)
         if not kwargs.get("output_logits"):
             return sequences
@@ -214,7 +224,7 @@ class WhitespaceTerminalAnswerFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
-        text = "work ANSWER: \n1\n" if self.reasoning else " \n1\n"
+        text = "work ANSWER: \n1\n" if self.reasoning else "ANSWER: \n1\n"
         suffix = torch.tensor(
             [self._encode(text) + [self.generation_config.eos_token_id]] * len(input_ids)
         )
@@ -247,8 +257,9 @@ class DistinctAssistantEndFakeModel(FakeModel):
         del attention_mask, max_new_tokens
         self.generate_calls += 1
         self.received_eos_token_ids = [int(value) for value in kwargs["eos_token_id"]]
+        answer = self.encode_answer("1")
         suffix = torch.tensor(
-            [[ord("1") + 3, 2, ord("\n") + 3, 299]] * len(input_ids)
+            [[*answer, 2, ord("\n") + 3, 299]] * len(input_ids)
         )
         return torch.cat([input_ids, suffix], dim=1)
 
@@ -264,7 +275,9 @@ def test_generation_stops_at_tokenizer_or_model_eos(tmp_path: Path) -> None:
     )
 
     assert set(model.received_eos_token_ids) == {2, 299}
-    assert all(row["generated_token_ids"] == tokenizer.encode("1") for row in results)
+    assert all(
+        row["generated_token_ids"] == tokenizer.encode("ANSWER: 1") for row in results
+    )
     assert all(row["completion"]["terminal_stop_token_id"] == 2 for row in results)
     assert all(row["completion"]["reached_eos"] is True for row in results)
 
@@ -292,7 +305,7 @@ def test_logits_are_measured_after_whitespace_immediately_before_candidate(
         ),
     )
 
-    generated_prefix = "work ANSWER: \n" if reasoning else " \n"
+    generated_prefix = "work ANSWER: \n" if reasoning else "ANSWER: \n"
     for row in results:
         assert row["semantic_answer_compliance"] is True
         assert row["exact_answer_format_compliance"] is False
@@ -331,19 +344,26 @@ def test_single_generation_teacher_forced_capture_scoring_and_resume(tmp_path: P
     assert model.generate_calls == 1
     assert all(row["model_choice"] == "X" for row in results)
     assert all(row["model_choice_surface"] == "1" for row in results)
-    assert all(row["assistant_completion"] == "ANSWER:1" for row in results)
+    assert all(row["assistant_completion"] == "ANSWER: 1" for row in results)
     assert all(row["strict_answer_compliance"] is True for row in results)
+    assert all(row["exact_answer_format_compliance"] is True for row in results)
     assert all(row["generation_messages"][-1]["role"] == "user" for row in results)
     assert all(
-        row["generation_messages"][-1]["content"].endswith("ANSWER:")
+        row["generation_messages"][-1]["content"].endswith(
+            "Do not output anything after the final answer line."
+        )
         for row in results
     )
     assert all(
-        row["generation_serialized_prompt"].endswith("ANSWER:<assistant>")
+        row["generation_serialized_prompt"].endswith(
+            "Do not output anything after the final answer line.<assistant>"
+        )
         for row in results
     )
-    assert all(row["generated_token_ids"] == tokenizer.encode("1") for row in results)
-    assert all(row["full_completion"] == "ANSWER:1" for row in results)
+    assert all(
+        row["generated_token_ids"] == tokenizer.encode("ANSWER: 1") for row in results
+    )
+    assert all(row["full_completion"] == "ANSWER: 1" for row in results)
     assert all(
         row["teacher_forced_input_ids"]
         == row["generation_input_ids"] + row["generated_sequence_token_ids"]
@@ -362,10 +382,13 @@ def test_single_generation_teacher_forced_capture_scoring_and_resume(tmp_path: P
     )
     assert all(row["x_minus_y_logit"] == pytest.approx(2) for row in results)
     assert all(
-        row["answer_boundary_source"] == "assistant_role_after_user_marker"
+        row["answer_boundary_source"] == "generated_completion"
         for row in results
     )
-    assert all(row["answer_boundary_generated_token_count"] == 0 for row in results)
+    assert all(
+        row["answer_boundary_generated_token_count"] == len(tokenizer.encode("ANSWER: "))
+        for row in results
+    )
     tensors = load_file(tmp_path / "runs/fake/activations" / f"{results[0]['row_id']}.safetensors")
     assert "answer.resid_pre.layer_0" in tensors
     assert "answer.resid_post.layer_1" in tensors
@@ -412,12 +435,15 @@ def test_runner_executes_mixed_reasoning_probe_parameterizations(tmp_path: Path)
     reasoning_off = [row for row in results if row["reasoning"] is False]
     reasoning_on = [row for row in results if row["reasoning"] is True]
     assert len(reasoning_off) == len(reasoning_on) == 4
-    assert all(row["full_completion"] == "ANSWER:1" for row in reasoning_off)
+    assert all(row["full_completion"] == "ANSWER: 1" for row in reasoning_off)
     assert all(row["strict_answer_compliance"] is True for row in reasoning_off)
-    assert all(row["full_completion"] == "1" for row in reasoning_on)
-    assert all(row["strict_answer_compliance"] is False for row in reasoning_on)
-    assert all(row["compliance_break"] == "missing_answer_marker" for row in reasoning_on)
-    assert all(row["answer_boundary_generated_token_count"] is None for row in reasoning_on)
+    assert all(row["full_completion"] == "ANSWER: 1" for row in reasoning_on)
+    assert all(row["strict_answer_compliance"] is True for row in reasoning_on)
+    assert all(row["compliance_break"] is None for row in reasoning_on)
+    assert all(
+        row["answer_boundary_generated_token_count"] == len(tokenizer.encode("ANSWER: "))
+        for row in reasoning_on
+    )
 
 
 def test_runner_routes_all_continuous_completions_through_sglang_mtp(
@@ -446,7 +472,11 @@ def test_runner_routes_all_continuous_completions_through_sglang_mtp(
         }
         results = {}
         for row_id, prompt in items:
-            text = "1" if "ANSWER:<assistant>" in prompt else "work ANSWER:1"
+            text = (
+                "ANSWER: 1"
+                if "Output only the final answer line." in prompt
+                else "work\nANSWER: 1"
+            )
             results[row_id] = {
                 "text": text,
                 "token_ids": tokenizer.encode(text),
@@ -656,7 +686,10 @@ def test_every_decode_position_teacher_forced_shapes(tmp_path: Path) -> None:
     )
     for stream in ("resid_pre", "token_mixer_out", "mlp_out", "resid_post"):
         for layer in range(2):
-            assert activations[f"answer.{stream}.layer_{layer}"].shape == (2, 4)
+            assert activations[f"answer.{stream}.layer_{layer}"].shape == (
+                len(results[0]["generated_sequence_token_ids"]),
+                4,
+            )
 
 
 def test_all_prompt_token_capture_removes_padding_per_row(tmp_path: Path) -> None:
@@ -778,7 +811,8 @@ class VerboseAnswerFakeModel(FakeModel):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
         suffix = torch.tensor(
-            [[ord(character) + 3 for character in "1 because"] + [2]] * len(input_ids)
+            [[ord(character) + 3 for character in "ANSWER: 1 because"] + [2]]
+            * len(input_ids)
         )
         return torch.cat([input_ids, suffix], dim=1)
 
@@ -791,7 +825,7 @@ def test_reasoning_off_rejects_an_explanatory_answer(tmp_path: Path) -> None:
         dataset,
         ExecutionConfig(experiment_dir=tmp_path, run_id="verbose_zero", batch_size=2),
     )
-    assert all(row["assistant_completion"] == "ANSWER:1 because" for row in results)
+    assert all(row["assistant_completion"] == "ANSWER: 1 because" for row in results)
     assert all(row["model_choice"] is None for row in results)
     assert all(row["strict_answer_compliance"] is False for row in results)
     assert all(row["no_reasoning_compliance"] is False for row in results)
@@ -801,7 +835,7 @@ class ReasonThenSameFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
-        text = "brief work ANSWER:SAME"
+        text = "brief work\nANSWER: SAME"
         suffix = torch.tensor(
             [[ord(character) + 3 for character in text] + [2]] * len(input_ids)
         )
@@ -839,7 +873,9 @@ def test_allow_same_with_reasoning_works_for_both_layouts(
     assert all(row["normative_comparison"] == "SAME" for row in results)
     assert all(row["ground_truth_choice"] == "SAME" for row in results)
     assert all(row["model_choice"] == "SAME" for row in results)
-    assert all(row["assistant_completion"] == "brief work ANSWER:SAME" for row in results)
+    assert all(
+        row["assistant_completion"] == "brief work\nANSWER: SAME" for row in results
+    )
     assert all(row["strict_answer_compliance"] is True for row in results)
     assert all(row["posterior_correct"] is True for row in results)
     assert all(row["call_layout"] == call_layout for row in results)
@@ -849,7 +885,7 @@ class ThinkingMarkerFakeModel(FakeModel):
     def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
         del attention_mask, max_new_tokens, kwargs
         self.generate_calls += 1
-        text = "<think>visible reasoning</think> ANSWER:1"
+        text = "<think>visible reasoning</think>\nANSWER: 1"
         suffix = torch.tensor([self._encode(text) + [2]] * len(input_ids))
         return torch.cat([input_ids, suffix], dim=1)
 
@@ -866,11 +902,11 @@ def test_reasoning_completion_is_stored_without_repair(tmp_path: Path) -> None:
         dataset,
         ExecutionConfig(experiment_dir=tmp_path, run_id="thinking_markers", batch_size=2),
     )[0]
-    assert result["completion"]["text"] == "<think>visible reasoning</think> ANSWER:1"
-    assert result["full_completion"] == "<think>visible reasoning</think> ANSWER:1"
+    assert result["completion"]["text"] == "<think>visible reasoning</think>\nANSWER: 1"
+    assert result["full_completion"] == "<think>visible reasoning</think>\nANSWER: 1"
     assert result["generated_token_ids"] == result["completion"]["token_ids"]
     assert result["strict_answer_compliance"] is True
     assert result["reasoning_length_tokens"] == len(
-        tokenizer.encode("<think>visible reasoning</think> ANSWER:")
+        tokenizer.encode("<think>visible reasoning</think>\nANSWER: ")
     )
     assert result["generation_settings"]["enable_thinking"] is False

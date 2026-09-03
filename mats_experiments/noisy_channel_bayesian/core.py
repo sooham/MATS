@@ -387,6 +387,19 @@ def derive_candidate_evidence(
     return evidence
 
 
+def _final_answer_format_lines(
+    *, probe: XVsYPosteriorProbe, allowed_values: Sequence[str]
+) -> list[str]:
+    return [
+        "FINAL-ANSWER FORMAT:",
+        "End your response with exactly one of these lines:",
+        *(f"{probe.answer_prefix} {value}" for value in allowed_values),
+        "Use exactly one ASCII space between the answer prefix and the decision value.",
+        f'Do not use "{probe.answer_prefix}" anywhere else in your response.',
+        "Do not output anything after the final answer line.",
+    ]
+
+
 def render_candidate_evidence_prompt(
     *,
     n: int,
@@ -432,9 +445,6 @@ def render_candidate_evidence_prompt(
         lines.append("")
     choices = f"{probe.x} or {probe.y}" + (" or SAME" if probe.allow_same else "")
     allowed_values = [str(probe.x), str(probe.y)] + (["SAME"] if probe.allow_same else [])
-    allowed_responses = " | ".join(
-        f"{probe.answer_prefix}{value}" for value in allowed_values
-    )
     lines.extend(
         [
             "Which candidate has greater posterior probability after all observations?",
@@ -445,10 +455,9 @@ def render_candidate_evidence_prompt(
                 else []
             ),
             "Do not provide reasoning, explanation, calculations, or intermediate work.",
-            (
-                f"Output exactly one of: {allowed_responses}. Do not include any other text "
-                "or punctuation, and do not insert whitespace after the answer prefix."
-            ),
+            "Output only the final answer line.",
+            "",
+            *_final_answer_format_lines(probe=probe, allowed_values=allowed_values),
         ]
     )
     return "\n".join(lines)
@@ -567,10 +576,6 @@ def render_observable_prompt(
                 f"probability {reliability_name} when the candidate's truthful answer matches "
                 f"the report and 1-{reliability_name} otherwise."
             ),
-            (
-                f"After {probe.answer_prefix}, emit exactly one value token based on posterior "
-                "probability."
-            ),
             f"The permitted values are {permitted_values}.",
         ]
     )
@@ -578,27 +583,23 @@ def render_observable_prompt(
         lines.extend(
             [
                 "Reason carefully from the raw observations and the stated channel rules.",
-                (
-                    f"Finish with {probe.answer_prefix} immediately followed by one permitted "
-                    "value. Do not put whitespace after the answer prefix or add text after "
-                    "the value."
-                ),
-                "REASONING:",
+                "Explain your reasoning before the final answer line.",
             ]
         )
     else:
         lines.extend(
             [
                 "Do not provide reasoning, explanation, calculations, or intermediate work.",
-                (
-                    "The value must be the entire completion: no other words, whitespace, "
-                    "markup, or punctuation."
-                ),
-                probe.answer_prefix,
+                "Output only the final answer line.",
             ]
         )
-    rendered = "\n".join(lines)
-    return rendered + ("\n" if stage == "reasoning" else "")
+    lines.extend(
+        [
+            "",
+            *_final_answer_format_lines(probe=probe, allowed_values=allowed_values),
+        ]
+    )
+    return "\n".join(lines)
 
 
 def initial_messages(

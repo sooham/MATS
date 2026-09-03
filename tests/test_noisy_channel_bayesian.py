@@ -330,14 +330,18 @@ def test_probe_values_are_the_model_facing_answer_surfaces(reasoning: bool) -> N
     assert "where X means" not in prompt
     assert "Compare only candidates 2 and 7." in prompt
     assert "The permitted values are 2, 7." in prompt
-    assert " | " not in prompt
+    assert "ANSWER: 2" in prompt
+    assert "ANSWER: 7" in prompt
+    assert "Use exactly one ASCII space" in prompt
+    assert 'Do not use "ANSWER:" anywhere else in your response.' in prompt
     if reasoning:
         assert "Reason carefully from the raw observations" in prompt
         assert "Do not provide reasoning" not in prompt
-        assert prompt.endswith("REASONING:\n")
+        assert "Explain your reasoning before the final answer line." in prompt
     else:
         assert "Do not provide reasoning, explanation, calculations" in prompt
-        assert prompt.endswith("ANSWER:")
+        assert "Output only the final answer line." in prompt
+    assert prompt.endswith("Do not output anything after the final answer line.")
     assert dataset[0]["answer_prefix"] == "ANSWER:"
 
     resolved = MetricSpec().resolve(x=2, y=7)
@@ -392,6 +396,10 @@ def test_candidate_evidence_projection_is_exact_paired_and_set_free(
     assert "The decision value must be exactly one of: 2 or 7." in prompt
     assert "Candidate X" not in prompt
     assert "Observation 1: AGREES; reliability 0.95." in prompt
+    assert "Output only the final answer line." in prompt
+    assert "ANSWER: 2" in prompt
+    assert "ANSWER: 7" in prompt
+    assert prompt.endswith("Do not output anything after the final answer line.")
     assert "Is s in" not in prompt
     assert "Observed report:" not in prompt
     assert "{2, 4}" not in prompt

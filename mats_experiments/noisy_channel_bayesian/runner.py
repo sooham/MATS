@@ -233,7 +233,7 @@ def parse_completion_contract(
         rf"{re.escape(answer_prefix)}(?P<leading_whitespace>\s*)"
         rf"(?P<value>{value_pattern})(?P<trailing_whitespace>\s*)"
     )
-    exact_pattern = rf"{re.escape(answer_prefix)}(?P<value>{value_pattern})"
+    exact_pattern = rf"{re.escape(answer_prefix)} (?P<value>{value_pattern})"
     semantic_match = (
         re.search(rf"{semantic_pattern}\Z", text)
         if reasoning
@@ -1490,11 +1490,7 @@ class QwenRunner:
             completion["generated_token_ids"] = generated_ids
             completion.setdefault("generated_sequence_token_ids", generated_ids)
             generated_text = str(completion["text"])
-            full_completion = (
-                generated_text
-                if bool(source["reasoning"])
-                else str(source.get("answer_prefix", "ANSWER:")) + generated_text
-            )
+            full_completion = generated_text
             full_completion_by_id[row_id] = full_completion
             surfaces = metric_specs_by_id[row_id].surfaces
             contract = parse_completion_contract(
@@ -1507,33 +1503,13 @@ class QwenRunner:
                 answer_prefix=str(source.get("answer_prefix", "ANSWER:")),
             )
             value_start = contract["answer_value_char_start"]
-            answer_prefix = str(source.get("answer_prefix", "ANSWER:"))
-            generated_value_start = (
-                int(value_start)
-                if bool(source["reasoning"]) and value_start is not None
-                else int(value_start) - len(answer_prefix)
-                if value_start is not None
-                else None
-            )
+            generated_value_start = int(value_start) if value_start is not None else None
             value_end = contract["answer_value_char_end"]
-            generated_value_end = (
-                int(value_end)
-                if bool(source["reasoning"]) and value_end is not None
-                else int(value_end) - len(answer_prefix)
-                if value_end is not None
-                else None
-            )
+            generated_value_end = int(value_end) if value_end is not None else None
             marker_end = contract["answer_marker_char_end"]
-            generated_marker_end = (
-                int(marker_end)
-                if bool(source["reasoning"]) and marker_end is not None
-                else 0
-                if marker_end is not None
-                else None
-            )
-            # For reasoning-off, full_completion has a synthetic ANSWER: prefix and
-            # generated_text starts immediately after it. In both modes this consumes
-            # exactly the generated whitespace before the actual terminal candidate.
+            generated_marker_end = int(marker_end) if marker_end is not None else None
+            # Both modes generate the complete terminal answer line. This consumes
+            # exactly the generated marker and whitespace before the candidate.
             boundary_count = (
                 self._generated_token_boundary(
                     generated_ids, generated_text, generated_value_start
@@ -1691,11 +1667,7 @@ class QwenRunner:
                 "generated_sequence_token_ids": completion["generated_sequence_token_ids"],
                 "teacher_forced_input_ids": teacher_forced_ids,
                 "teacher_forced_completion_start": len(prompt_ids),
-                "answer_boundary_source": (
-                    "generated_completion"
-                    if bool(source["reasoning"])
-                    else "assistant_role_after_user_marker"
-                ),
+                "answer_boundary_source": "generated_completion",
                 "answer_boundary_generated_token_count": boundary_count,
                 "answer_boundary_input_index": (
                     len(prompt_ids) + boundary_count - 1
