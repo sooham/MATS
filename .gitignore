@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+*.safetensors
 
 # Local model weights and Hugging Face caches
 models/
