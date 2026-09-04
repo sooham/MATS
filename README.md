@@ -128,6 +128,10 @@ resumes safely through the Hugging Face cache.
 - `notebooks/07_scaled_filler_grid.ipynb` crosses eight domain sizes with all eleven reliability values while exactly counterbalancing candidate order and X/Y answer aliases within each cell.
 - `notebooks/08_filler_alias_mechanism.ipynb` uses a causal X/Y alias swap and a 33-depth logit lens to distinguish semantic candidate selection from answer-token bias.
 - `notebooks/09_qwen35_model_size_comparison.ipynb` compares the frozen notebook-05 prompt, the full notebook-06 filler grid, and a held-out zero-scratchpad `F=0` readout across pinned Qwen3.5-4B, Qwen3.5-9B, and Qwen3.5-27B-GPTQ-Int4 checkpoints.
+- `notebooks/10_qwen35_candidate_readout_thinking_budget.ipynb` consolidates the original label probe, visible-deliberation result, zero-generated-reasoning controls, and the historical native-thinking comparison.
+- `notebooks/11_noisy_channel_bayesian_framework.ipynb` introduces the exact, exhaustive noisy-channel dataset and paired candidate-evidence control used by the later reliability experiments.
+- `notebooks/12_noisy_channel_bayesian_agreement_logits.ipynb` measures order-balanced candidate logits for Qwen3.5-4B and 9B at reliability 9/10, with and without an ordinary visible explanation.
+- `notebooks/13_noisy_channel_bayesian_agreement_logits.ipynb` replays identical exhaustive evidence across reliability 0/10, 1/10, 5/10, 9/10, and 10/10. It shows that 9B's immediate answer margin tracks agreement with the source even below reliability 1/2, while visible explanation restores the required sign inversion. Both conditions disable native Qwen thinking.
 
 Reproduce the frozen single-call held-out result with:
 
@@ -151,3 +155,5 @@ annotated ledger in [`CITATIONS.md`](CITATIONS.md).
 The proposed mechanistic follow-up—three ranked hypotheses, exact causal interventions, failure
 criteria, and an RTX-5090/Qwen3.5 execution plan—is in
 [`reports/research_agenda/REPORT.md`](reports/research_agenda/REPORT.md).
+The focused notebook-13 interpretation and revised reliability-sign-gate experiment ladder are in
+[`reports/research_agenda/NOTEBOOK13_UPDATE.md`](reports/research_agenda/NOTEBOOK13_UPDATE.md).
