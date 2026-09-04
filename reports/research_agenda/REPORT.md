@@ -1,5 +1,12 @@
 # Mechanistic research agenda: Bayesian evidence grounding under unreliable and strategic sources
 
+> **Notebook 13 update (2026-09-04):** The full Qwen3.5-9B reliability sweep shows a robust
+> reliability-invariant agreement signal under immediate answering and a correctly signed signal
+> only after visible explanation. The focused interpretation, revised hypotheses, non-tie
+> factorial, and RTX 5090 execution plan are in
+> [`NOTEBOOK13_UPDATE.md`](NOTEBOOK13_UPDATE.md). That update supersedes the ordering and immediate
+> next steps below; this document remains the broader three-project agenda.
+
 ## Executive recommendation
 
 The project should ask one overarching question:
@@ -34,6 +41,7 @@ text, not Qwen thinking mode.
 | Notebook 07 | Scaling the domain leaves candidate-only accuracy at 50.8% and produces an extreme surface bias: 2,799/2,816 predictions are `Y`, with no ties. Reliability is part of the RNG seed, so reliability cells do not replay the same evidence. | Candidate identity, position, and label must be independently crossed. Larger domains do not by themselves create a reasoning test, and future reliability contrasts must be paired. |
 | Notebook 08 | Under alias swaps, underscore has 1.9% semantic consistency and 98.1% surface-token invariance; period has 12.5% and 70.6%, respectively. More sharply, aggregate semantic consistency rises to 78.4% at residual depth 30 and collapses to 7.2% at the final depth; for underscore it falls from 85.0% to 1.9%. Depth-30 semantic accuracy is only 55.5%. | The final block is a sharply motivated causal target for alias overwrite, but the earlier alias-equivariant state is not yet an accurate posterior. |
 | Notebook 09 | Visible derivation is near ceiling for 4B/9B/27B, but direct no-scratchpad non-tie accuracy is 51.7%/55.0%/63.3%. Filler-grid raw means are 0.508/0.530/0.618 and balanced means are 0.505/0.514/0.561. Across 84,840 filler-grid decisions and 336 direct held-out decisions, no model ever selects `=`. | Scale helps modestly in the direct condition but does not remove the interface problem. Tie measurement is broken, and the 27B result is confounded by GPTQ-Int4 and backend differences. |
+| Notebook 13 | For 9B immediate answers, agreement/logit correlation stays positive from $r=0$ through $r=1$, including Spearman .634 at $r=.1$; paired $r=.1/.9$ margins correlate +.940. Visible explanations invert the low-reliability slope and make the paired margins correlate -.994. | The lead target is now the missing interaction between agreement and reliability sign. Locate the reliability-invariant and signed components separately, then test them with crossed interchange interventions. |
 
 A new, no-GPU screen joined the existing direct F=0 rows to the exact analytic target. For the 64
 interior-reliability examples per model, Spearman correlation between the final `2`-minus-`7` logit

@@ -66,6 +66,23 @@ Abstraction: A Theoretical Foundation for Mechanistic Interpretability.” arXiv
 - **Applied in:** Behavioral stopping-point section of
   `notebooks/03_controlled_posterior_behavior.ipynb` and `reports/research_agenda/REPORT.md`.
 
+### `GeigerEtAl2024DAS` — Distributed alignment search
+
+Atticus Geiger, Zhengxuan Wu, Christopher Potts, Thomas Icard, and Noah D. Goodman. “Finding
+Alignments Between Interpretable Causal Variables and Distributed Neural Representations.”
+*Conference on Causal Learning and Reasoning (CLeaR)*, 2024.
+[Paper](https://proceedings.mlr.press/v236/geiger24a.html)
+
+- **Status:** Applied to the mechanistic research agenda.
+- **Consulted:** 2026-09-04
+- **Relevant result:** DAS learns a non-standard basis that aligns distributed neural states with
+  high-level causal variables, then evaluates those alignments with interchange interventions.
+- **Use here:** Permits a low-dimensional search for agreement, reliability, or posterior variables
+  only after whole-state localization. Held-out interchange accuracy—not probe accuracy or
+  steering—is the acceptance criterion.
+- **Applied in:** `reports/research_agenda/REPORT.md` and
+  `reports/research_agenda/NOTEBOOK13_UPDATE.md`, reliability-gate causal tests.
+
 ### `FalckEtAl2024` — Necessary tests for Bayesian in-context learning
 
 Fabian Falck, Ziyu Wang, and Christopher C. Holmes. “Is In-Context Learning in Large Language
@@ -178,6 +195,38 @@ What They Think: Unfaithful Explanations in Chain-of-Thought Prompting.” *Neur
 - **Use here:** Visible derivations are treated as an experimental condition whose atomic steps
   must be intervened on, not as transparent evidence of the underlying computation.
 - **Applied in:** `reports/research_agenda/REPORT.md`, Experiment 2.
+
+### `LanhamEtAl2023` — Interventions on chain-of-thought faithfulness
+
+Tamera Lanham, Anna Chen, Ansh Radhakrishnan, et al. “Measuring Faithfulness in Chain-of-Thought
+Reasoning.” arXiv:2307.13702, 2023.
+[Paper](https://arxiv.org/abs/2307.13702)
+
+- **Status:** Applied
+- **Consulted:** 2026-09-04
+- **Relevant result:** Early-answering, mistake-insertion, filler, and paraphrase interventions show
+  that dependence on written reasoning varies strongly by task; extra filler tokens alone do not
+  explain chain-of-thought gains.
+- **Use here:** Determines the early-answer curve and atomic audit-corruption controls needed to
+  decide whether notebook 13's visible explanation computes the reliability inversion or merely
+  rationalizes/anchors an answer.
+- **Applied in:** `reports/research_agenda/NOTEBOOK13_UPDATE.md`, Experiment 3.
+
+### `ZhangEtAl2025Reasoning` — Causal flow from reasoning tokens to answers
+
+Jue Zhang, Qingwei Lin, Saravan Rajmohan, and Dongmei Zhang. “From Reasoning to Answer: Empirical,
+Attention-Based and Mechanistic Insights into Distilled DeepSeek R1 Models.” *EMNLP*, 2025.
+[Paper](https://aclanthology.org/2025.emnlp-main.198/)
+
+- **Status:** Applied with a scope caveat
+- **Consulted:** 2026-09-04
+- **Relevant result:** Residual-stream patches at selected reasoning-token positions can move final
+  answer logits in distilled R1 models. The reported effect is stronger for a probing phrase that
+  repeats answer-format fragments, which the authors note may create an induction-like pattern.
+- **Use here:** Supports directly testing reasoning-to-answer mediation while requiring
+  conclusion-free, token-aligned audits and controls for answer-format repetition. It is not taken
+  as evidence that Qwen3.5 uses the same mechanism.
+- **Applied in:** `reports/research_agenda/NOTEBOOK13_UPDATE.md`, Experiment 3.
 
 ### `HalawiEtAl2024` — Correct early state overwritten by late imitation
 
