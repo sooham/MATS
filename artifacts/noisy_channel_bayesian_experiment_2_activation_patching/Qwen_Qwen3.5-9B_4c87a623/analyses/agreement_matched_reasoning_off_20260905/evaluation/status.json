@@ -1,8 +1,0 @@
-{
-  "complete": false,
-  "jobs_done": 1090,
-  "jobs_expected": 4340,
-  "error": "[Errno 32] Broken pipe",
-  "error_type": "BrokenPipeError",
-  "pid": 451090
-}

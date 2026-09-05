@@ -1,7 +1,0 @@
-site,target,layer,best_cv_score,r2,auroc,row_count
-assistant_turn_boundary,reliability_sign,0,1.0,,1.0,640
-assistant_turn_boundary,gain_abs,1,0.9963832810242037,0.9971150760876702,,640
-assistant_turn_boundary,z_heuristic,19,0.24984332413435711,0.3811189752548747,,640
-assistant_turn_boundary,z_bayes,20,0.005816519094684458,0.009249154901313617,,640
-assistant_turn_boundary,delta_a,23,0.4058409963455592,0.5155104373615484,,640
-assistant_turn_boundary,gain,30,0.9975452912677735,0.9971181401743378,,640
