@@ -1,0 +1,13 @@
+tier,split,labels,pairs,mixed_groups,unique_clean,unique_corrupt,schedules,winners
+totals,train,emitted,7626,41,477,679,48,"['C1', 'C2']"
+totals,train,emitted_and_strict_boundary,6302,40,462,609,48,"['C1', 'C2']"
+totals,test,emitted,160,26,63,57,7,"['C1', 'C2']"
+totals,test,emitted_and_strict_boundary,119,21,53,36,7,['C2']
+totals,all,emitted,10100,41,543,786,55,"['C1', 'C2']"
+totals,all,emitted_and_strict_boundary,8246,40,523,706,55,"['C1', 'C2']"
+grid,train,emitted,1248,126,452,413,48,"['C1', 'C2']"
+grid,train,emitted_and_strict_boundary,1037,124,433,354,48,"['C1', 'C2']"
+grid,test,emitted,0,0,0,0,0,[]
+grid,test,emitted_and_strict_boundary,0,0,0,0,0,[]
+grid,all,emitted,1609,127,508,480,55,"['C1', 'C2']"
+grid,all,emitted_and_strict_boundary,1329,124,484,408,55,"['C1', 'C2']"

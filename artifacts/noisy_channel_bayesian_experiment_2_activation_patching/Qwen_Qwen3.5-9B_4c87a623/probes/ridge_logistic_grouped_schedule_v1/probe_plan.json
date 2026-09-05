@@ -1,0 +1,81 @@
+{
+  "activation_run_id": "qwen35_9b_n9_k3_resid_post_all_tokens_v1",
+  "activation_stream": "resid_post",
+  "binary_targets": [
+    "reliability_sign"
+  ],
+  "continuous_targets": [
+    "delta_a",
+    "gain",
+    "gain_abs",
+    "z_bayes",
+    "z_heuristic"
+  ],
+  "cv_folds": 5,
+  "dataset_split_fingerprint": "381c3509f89624d16380c8cbef39c11177144c7f463ad6c4783fb9276a50279a",
+  "layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "logistic_c_values": [
+    0.0001,
+    0.001,
+    0.01,
+    0.1,
+    1.0,
+    10.0,
+    100.0,
+    1000.0,
+    10000.0
+  ],
+  "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+  "probe_config_fingerprint": "531b9cdbe2a8edf07034c9ac4a5c68dd3aa1ce36d6a6a4fab9d8f5f8415000ce",
+  "ridge_alphas": [
+    0.001,
+    0.01,
+    0.1,
+    1.0,
+    10.0,
+    100.0,
+    1000.0,
+    10000.0,
+    100000.0,
+    1000000.0
+  ],
+  "schema_version": 1,
+  "sites": [
+    "final_prompt",
+    "answer_prefix"
+  ],
+  "top_k_layers": 3
+}

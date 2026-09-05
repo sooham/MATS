@@ -488,13 +488,12 @@ def render_observable_prompt(
         ),
     ]
     if shared_reliability:
-        exact_r = fraction_text(reliabilities[0])
         displayed_r = reliability_surface(reliabilities[0])
         lines.extend(
             [
                 (
                     "The observed SOURCE report equals the truthful answer with probability "
-                    f"r={displayed_r} (exactly {exact_r}) and is flipped with probability "
+                    f"r={displayed_r} and is flipped with probability "
                     f"1-r={reliability_surface(1 - reliabilities[0])}."
                 ),
                 (
@@ -537,10 +536,7 @@ def render_observable_prompt(
         suffix = (
             ""
             if shared_reliability
-            else (
-                f" [SOURCE reliability r={reliability_surface(reliability)} "
-                f"(exactly {fraction_text(reliability)})]"
-            )
+            else f" [SOURCE reliability r={reliability_surface(reliability)}]"
         )
         membership = question["membership_set"]
         lines.append(f"Q{index}: Is s in {_format_set(membership)}?{suffix}")  # type: ignore[arg-type]
@@ -590,7 +586,7 @@ def render_observable_prompt(
         lines.extend(
             [
                 "Do not provide reasoning, explanation, calculations, or intermediate work.",
-                "Output only the final answer line.",
+                "Output only the final answer line. Thanks.",
             ]
         )
     lines.extend(
@@ -620,6 +616,8 @@ class CaptureSpec:
     inline in each result.  Full scope persists vocabulary tensors; ``logit_tokens``
     selects prompt positions, while ``every_decode_position`` switches capture to
     every generated position.  Activation ``tokens`` are selected independently.
+    The special value ``"row_selected"`` reads an ``activation_token_selector``
+    selector from each dataset row, enabling sparse semantically aligned capture.
     """
 
     logits_boundaries: tuple[str, ...] = ()

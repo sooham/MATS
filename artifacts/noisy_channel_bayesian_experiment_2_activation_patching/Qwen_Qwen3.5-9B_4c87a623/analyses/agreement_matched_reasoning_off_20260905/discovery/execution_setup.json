@@ -1,0 +1,18 @@
+{
+  "pid": 428350,
+  "before": {
+    "total_mib": 32607,
+    "free_mib": 12887,
+    "utilization_percent": 0,
+    "owners": {
+      "273484": 642,
+      "326499": 18568
+    }
+  },
+  "allocator_cap_mib": 6144,
+  "cpu_weight_offload": true,
+  "batch_size_requested": 4,
+  "existing_processes_modified": false,
+  "cached_suffix": true,
+  "design_sha256": "a7f81f9620ccef885c9b6d9361b00fb45a2d5d36cb7e11c5f2fc29f053fbf269"
+}

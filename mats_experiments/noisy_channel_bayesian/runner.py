@@ -1069,22 +1069,74 @@ class QwenRunner:
                 tokens.append(str(token))
         return {"input_ids": input_ids, "tokens": tokens}
 
-    def _generated_token_boundary(
-        self, token_ids: Sequence[int], text: str, char_end: int
-    ) -> int | None:
-        """Return the exact generated-token boundary for a character boundary."""
+    def _generated_token_offsets(
+        self, token_ids: Sequence[int], text: str
+    ) -> list[tuple[int, int]] | None:
+        """Map generated tokens to decoded character spans, preferring fast offsets."""
 
-        if not 0 <= char_end <= len(text):
-            return None
+        try:
+            encoded = self.tokenizer(
+                text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            encoded_ids = [int(value) for value in encoded["input_ids"]]
+            offsets = [
+                (int(start), int(end)) for start, end in encoded["offset_mapping"]
+            ]
+            if encoded_ids == list(token_ids) and len(offsets) == len(token_ids):
+                return offsets
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        # Some token sequences are not reproduced by re-encoding their decoded text.
+        # Decode each prefix once as a conservative fallback.
+        prefix_lengths = []
         for count in range(len(token_ids) + 1):
             prefix = self.tokenizer.decode(
                 list(token_ids[:count]), skip_special_tokens=True
             )
-            if prefix == text[:char_end]:
-                return count
-            if len(prefix) > char_end:
+            if not text.startswith(prefix):
                 return None
-        return None
+            prefix_lengths.append(len(prefix))
+        if prefix_lengths[-1] != len(text):
+            return None
+        return list(zip(prefix_lengths[:-1], prefix_lengths[1:], strict=True))
+
+    @staticmethod
+    def _token_boundary_from_offsets(
+        offsets: Sequence[tuple[int, int]] | None, char_end: int | None
+    ) -> int | None:
+        """Return the exact generated-token count at a character boundary."""
+
+        if offsets is None or char_end is None:
+            return None
+        if char_end == 0:
+            return 0
+        matches = [
+            index + 1 for index, (_, end) in enumerate(offsets) if end == char_end
+        ]
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def _token_overlap_span_from_offsets(
+        offsets: Sequence[tuple[int, int]] | None,
+        char_start: int | None,
+        char_end: int | None,
+    ) -> tuple[int, int] | None:
+        """Return the token interval overlapping a decoded character span."""
+
+        if (
+            offsets is None
+            or char_start is None
+            or char_end is None
+            or not 0 <= char_start < char_end
+        ):
+            return None
+        overlapping = [
+            index
+            for index, (start, end) in enumerate(offsets)
+            if end > char_start and start < char_end
+        ]
+        return (overlapping[0], overlapping[-1] + 1) if overlapping else None
 
     def _score_batch(
         self, prompts: Sequence[str], metric_specs: Sequence[MetricSpec]
@@ -1214,6 +1266,7 @@ class QwenRunner:
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
         boundary_token_counts: Mapping[str, int | None] | None = None,
         metric_specs: Mapping[str, MetricSpec] | None = None,
+        row_token_selectors: Mapping[str, object] | None = None,
         capture_logits: bool = True,
     ) -> dict[str, dict[str, object]]:
         """Forward once and atomically split captured tensors into per-row files."""
@@ -1269,6 +1322,7 @@ class QwenRunner:
         for row_index, (row_id, _) in enumerate(items):
             mask = encoded["attention_mask"][row_index].to(dtype=torch.bool)
             activation_tensors: dict[str, Any] = {}
+            selected_activation_indices: list[int] | None = None
             logit_tensors: dict[str, Any] = {}
             surface_logits: dict[str, object] | None = None
             if wants_logits:
@@ -1314,7 +1368,15 @@ class QwenRunner:
                     start = len(prompt_ids[row_index])
                     selected = unpadded[start : start + count]
                 else:
-                    indices = resolve_selector(spec.tokens, len(unpadded))
+                    selector = (
+                        row_token_selectors[row_id]
+                        if row_token_selectors is not None else spec.tokens
+                    )
+                    # Semantic prompt spans and a negative-indexed completion tail may
+                    # overlap for short completions. Persist each absolute position once
+                    # in a stable order so the sparse-index metadata is canonical.
+                    indices = sorted(set(resolve_selector(selector, len(unpadded))))
+                    selected_activation_indices = indices
                     selected = unpadded[indices]
                 activation_tensors[f"{boundary}.{stream}.layer_{layer}"] = selected.detach().cpu()
             paths: dict[str, object] = {}
@@ -1327,6 +1389,10 @@ class QwenRunner:
                     activation_tensors = {**load_file(path), **activation_tensors}
                 _atomic_safetensors(path, activation_tensors)
                 paths["activation_path"] = str(path.relative_to(run_dir))
+                if row_token_selectors is not None:
+                    if selected_activation_indices is None:
+                        raise RuntimeError("Sparse activation indices were not resolved.")
+                    paths["activation_token_indices"] = selected_activation_indices
             if logit_tensors:
                 path = run_dir / "logits" / f"{row_id}.safetensors"
                 if path.exists():
@@ -1352,6 +1418,7 @@ class QwenRunner:
         decode_token_ids: Mapping[str, Sequence[int]] | None = None,
         boundary_token_counts: Mapping[str, int | None] | None = None,
         metric_specs: Mapping[str, MetricSpec] | None = None,
+        row_token_selectors: Mapping[str, object] | None = None,
         capture_logits: bool = True,
     ) -> dict[str, dict[str, object]]:
         """Retry capture OOMs by recursively splitting without retaining hook buffers."""
@@ -1365,6 +1432,7 @@ class QwenRunner:
                 decode_token_ids=decode_token_ids,
                 boundary_token_counts=boundary_token_counts,
                 metric_specs=metric_specs,
+                row_token_selectors=row_token_selectors,
                 capture_logits=capture_logits,
             )
         except RuntimeError as error:
@@ -1396,6 +1464,16 @@ class QwenRunner:
                 if boundary_token_counts is not None
                 else None
             )
+            first_selectors = (
+                {row_id: row_token_selectors[row_id] for row_id, _ in items[:midpoint]}
+                if row_token_selectors is not None
+                else None
+            )
+            second_selectors = (
+                {row_id: row_token_selectors[row_id] for row_id, _ in items[midpoint:]}
+                if row_token_selectors is not None
+                else None
+            )
             return {
                 **self._capture_resilient(
                     items=items[:midpoint],
@@ -1405,6 +1483,7 @@ class QwenRunner:
                     decode_token_ids=first_ids,
                     boundary_token_counts=first_boundaries,
                     metric_specs=metric_specs,
+                    row_token_selectors=first_selectors,
                     capture_logits=capture_logits,
                 ),
                 **self._capture_resilient(
@@ -1415,6 +1494,7 @@ class QwenRunner:
                     decode_token_ids=second_ids,
                     boundary_token_counts=second_boundaries,
                     metric_specs=metric_specs,
+                    row_token_selectors=second_selectors,
                     capture_logits=capture_logits,
                 ),
             }
@@ -1506,30 +1586,29 @@ class QwenRunner:
             generated_value_start = int(value_start) if value_start is not None else None
             value_end = contract["answer_value_char_end"]
             generated_value_end = int(value_end) if value_end is not None else None
+            marker_start = contract["answer_marker_char_start"]
+            generated_marker_start = int(marker_start) if marker_start is not None else None
             marker_end = contract["answer_marker_char_end"]
             generated_marker_end = int(marker_end) if marker_end is not None else None
+            generated_offsets = self._generated_token_offsets(
+                generated_ids, generated_text
+            )
             # Both modes generate the complete terminal answer line. This consumes
             # exactly the generated marker and whitespace before the candidate.
-            boundary_count = (
-                self._generated_token_boundary(
-                    generated_ids, generated_text, generated_value_start
-                )
-                if generated_value_start is not None
-                else None
+            boundary_count = self._token_boundary_from_offsets(
+                generated_offsets, generated_value_start
             )
-            marker_boundary_count = (
-                self._generated_token_boundary(
-                    generated_ids, generated_text, generated_marker_end
-                )
-                if generated_marker_end is not None
-                else None
+            marker_boundary_count = self._token_boundary_from_offsets(
+                generated_offsets, generated_marker_end
             )
-            value_end_boundary_count = (
-                self._generated_token_boundary(
-                    generated_ids, generated_text, generated_value_end
-                )
-                if generated_value_end is not None
-                else None
+            marker_start_boundary_count = self._token_boundary_from_offsets(
+                generated_offsets, generated_marker_start
+            )
+            value_end_boundary_count = self._token_boundary_from_offsets(
+                generated_offsets, generated_value_end
+            )
+            answer_line_token_span = self._token_overlap_span_from_offsets(
+                generated_offsets, generated_marker_start, generated_value_end
             )
             contract["answer_boundary_break"] = (
                 "answer_candidate_not_at_token_boundary"
@@ -1537,7 +1616,16 @@ class QwenRunner:
                 else None
             )
             contract["answer_marker_generated_token_count"] = marker_boundary_count
+            contract["answer_marker_start_generated_token_count"] = (
+                marker_start_boundary_count
+            )
             contract["answer_value_end_generated_token_count"] = value_end_boundary_count
+            contract["answer_line_generated_token_start"] = (
+                answer_line_token_span[0] if answer_line_token_span is not None else None
+            )
+            contract["answer_line_generated_token_end"] = (
+                answer_line_token_span[1] if answer_line_token_span is not None else None
+            )
             contract["answer_leading_whitespace_token_ids"] = (
                 generated_ids[marker_boundary_count:boundary_count]
                 if marker_boundary_count is not None and boundary_count is not None
@@ -1558,6 +1646,18 @@ class QwenRunner:
 
         capture_records: dict[str, dict[str, object]] = {}
         if config.capture.enabled:
+            if config.capture.tokens == "row_selected":
+                row_token_selectors = {}
+                for row_id, source in pending_by_id.items():
+                    selector = source.get("activation_token_selector")
+                    if not isinstance(selector, list) or not selector:
+                        raise ValueError(
+                            "CaptureSpec(tokens='row_selected') requires every dataset row "
+                            "to contain a non-empty activation_token_selector list."
+                        )
+                    row_token_selectors[row_id] = selector
+            else:
+                row_token_selectors = None
             capture_batch_size = config.batch_size_for("capture")
             for start in range(0, len(generation_items), capture_batch_size):
                 capture_items = generation_items[start : start + capture_batch_size]
@@ -1568,6 +1668,10 @@ class QwenRunner:
                 boundaries = {
                     row_id: boundary_token_counts[row_id] for row_id, _ in capture_items
                 }
+                selectors = (
+                    {row_id: row_token_selectors[row_id] for row_id, _ in capture_items}
+                    if row_token_selectors is not None else None
+                )
                 captured = self._capture_resilient(
                     items=capture_items,
                     boundary="answer",
@@ -1576,6 +1680,7 @@ class QwenRunner:
                     decode_token_ids=decode_ids,
                     boundary_token_counts=boundaries,
                     metric_specs=metric_specs_by_id,
+                    row_token_selectors=selectors,
                 )
                 for row_id, values in captured.items():
                     capture_records.setdefault(row_id, {}).update(values)
@@ -1716,11 +1821,20 @@ class QwenRunner:
                     "answer_trailing_whitespace_character_count"
                 ],
                 "answer_boundary_break": contract["answer_boundary_break"],
+                "answer_marker_start_generated_token_count": contract[
+                    "answer_marker_start_generated_token_count"
+                ],
                 "answer_marker_generated_token_count": contract[
                     "answer_marker_generated_token_count"
                 ],
                 "answer_value_end_generated_token_count": contract[
                     "answer_value_end_generated_token_count"
+                ],
+                "answer_line_generated_token_start": contract[
+                    "answer_line_generated_token_start"
+                ],
+                "answer_line_generated_token_end": contract[
+                    "answer_line_generated_token_end"
                 ],
                 "answer_leading_whitespace_token_ids": contract[
                     "answer_leading_whitespace_token_ids"

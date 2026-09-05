@@ -1,4 +1,4 @@
-"""Read-only exploration helpers for notebook 13's noisy-channel artifacts.
+"""Read-only exploration helpers for noisy-channel Bayesian artifacts.
 
 This module deliberately has no dependency on ``noisy_channel_bayesian``.  It
 reads the completed JSONL artifact, derives analysis-friendly scalar columns,
@@ -659,9 +659,17 @@ class Query:
 
 
 class ExperimentExplorer:
-    """Raw record access plus in-memory SQLite views of notebook 13 artifacts."""
+    """Raw record access plus optional paired SQLite views of experiment artifacts."""
 
-    def __init__(self, results_path: Path) -> None:
+    def __init__(
+        self,
+        results_path: Path,
+        *,
+        build_position_pairs: bool = True,
+        build_reasoning_pairs: bool = True,
+    ) -> None:
+        if build_reasoning_pairs and not build_position_pairs:
+            raise ValueError("Reasoning pairs require position-balanced rows.")
         self.results_path = results_path.resolve(strict=True)
         self.source_rows = load_jsonl_readonly(self.results_path)
         if not self.source_rows:
@@ -671,13 +679,23 @@ class ExperimentExplorer:
             raise ValueError("Source JSONL contains duplicate row IDs.")
         self._raw_by_id = dict(zip(row_ids, self.source_rows, strict=True))
         self.transcript_rows = [flatten_transcript_row(row) for row in self.source_rows]
-        self.balanced_rows = make_balanced_rows(self.transcript_rows)
-        self.reasoning_pairs = make_reasoning_pairs(self.balanced_rows)
+        self.balanced_rows = (
+            make_balanced_rows(self.transcript_rows) if build_position_pairs else []
+        )
+        self.reasoning_pairs = (
+            make_reasoning_pairs(self.balanced_rows) if build_reasoning_pairs else []
+        )
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self._register_table("transcript_rows", self.transcript_rows)
-        self._register_table("balanced_rows", self.balanced_rows)
-        self._register_table("reasoning_pairs", self.reasoning_pairs)
+        table_names = ["transcript_rows"]
+        if self.balanced_rows:
+            self._register_table("balanced_rows", self.balanced_rows)
+            table_names.append("balanced_rows")
+        if self.reasoning_pairs:
+            self._register_table("reasoning_pairs", self.reasoning_pairs)
+            table_names.append("reasoning_pairs")
+        self._table_names = tuple(table_names)
         # Defense in depth: even the derived in-memory database rejects writes after setup.
         self.connection.execute("PRAGMA query_only = ON")
 
@@ -713,7 +731,7 @@ class ExperimentExplorer:
         self.connection.commit()
 
     def table_names(self) -> tuple[str, ...]:
-        return ("transcript_rows", "balanced_rows", "reasoning_pairs")
+        return self._table_names
 
     def columns(self, table: str) -> SQLResult:
         if table not in self.table_names():
@@ -756,3 +774,12 @@ class ExperimentExplorer:
 def load_explorer(results_path: Path | None = None) -> ExperimentExplorer:
     """Convenience constructor used by the exploration notebook."""
     return ExperimentExplorer(results_path or default_results_path())
+
+
+def load_transcript_explorer(results_path: Path) -> ExperimentExplorer:
+    """Load a run that has no position or reasoning pairs."""
+    return ExperimentExplorer(
+        results_path,
+        build_position_pairs=False,
+        build_reasoning_pairs=False,
+    )

@@ -1,0 +1,20 @@
+{
+  "activation_file_bytes": 64440442880,
+  "activation_file_gib": 60.01483917236328,
+  "activation_split_rows": {
+    "test": 640,
+    "train": 4480
+  },
+  "answer_line_available_rows": 5120,
+  "answer_line_coverage_fraction": 1.0,
+  "dtype": "torch.bfloat16",
+  "layer_count": 32,
+  "maximum_captured_positions": 48,
+  "maximum_sequence_tokens": 529,
+  "minimum_captured_positions": 48,
+  "minimum_sequence_tokens": 529,
+  "reasoning": false,
+  "reasoning_mode": "reasoning_off",
+  "row_count": 5120,
+  "stream_count": 1
+}

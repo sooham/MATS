@@ -1,0 +1,31 @@
+{
+  "best_cv_score": 0.9731507927241113,
+  "best_params": {
+    "model__alpha": 0.001
+  },
+  "feature_count": 4096,
+  "kind": "ridge",
+  "layer": 16,
+  "probe_config_fingerprint": "531b9cdbe2a8edf07034c9ac4a5c68dd3aa1ce36d6a6a4fab9d8f5f8415000ce",
+  "selection_metric": "r2",
+  "site": "answer_prefix",
+  "target": "gain_abs",
+  "test_rows_used": 0,
+  "train_row_count": 449,
+  "train_schedule_ids": [
+    0,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "allowed_activation_payload_gib": 144.0,
+  "bytes_per_token_across_saved_layers": 262144,
+  "effective_target_capacity_gib": 188.0024070739746,
+  "existing_activation_files_gib": 0.0,
+  "free_disk_gib_before_capture": 188.0024070739746,
+  "maximum_completion_tokens_by_reasoning": {
+    "reasoning_off": 64,
+    "reasoning_on": 4096
+  },
+  "maximum_prompt_tokens": 523,
+  "maximum_selected_activation_positions": 57,
+  "mean_prompt_tokens": 523.0,
+  "mean_selected_activation_positions": 57.0,
+  "minimum_prompt_tokens": 523,
+  "minimum_selected_activation_positions": 57,
+  "required_free_disk_reserve_gib": 25.0,
+  "worst_case_activation_payload_gib": 142.5
+}

@@ -1,0 +1,14 @@
+{
+  "activation_file_bytes": 211127537664,
+  "activation_file_gib": 196.6278419494629,
+  "activation_split_rows": {
+    "test": 128,
+    "train": 896
+  },
+  "dtype": "torch.bfloat16",
+  "layer_count": 32,
+  "maximum_sequence_tokens": 1043,
+  "minimum_sequence_tokens": 530,
+  "row_count": 1024,
+  "stream_count": 1
+}
