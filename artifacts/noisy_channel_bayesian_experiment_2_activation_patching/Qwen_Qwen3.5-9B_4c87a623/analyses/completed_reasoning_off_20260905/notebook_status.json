@@ -1,0 +1,19 @@
+{
+  "reasoning_off_only": true,
+  "complete_sites": [
+    "domain_boundary",
+    "reliability_rule_boundary",
+    "reliability_r_value",
+    "reliability_one_minus_r_value",
+    "report_1_answer",
+    "report_2_answer",
+    "report_3_answer",
+    "final_prompt",
+    "answer_line"
+  ],
+  "frozen_probe_count": 1728,
+  "test_metric_count": 5184,
+  "original_training_untouched": true,
+  "cuda_available": false,
+  "analysis_root": "/workspace/MATS/artifacts/noisy_channel_bayesian_experiment_2_activation_patching/Qwen_Qwen3.5-9B_4c87a623/analyses/completed_reasoning_off_20260905"
+}

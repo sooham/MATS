@@ -1,0 +1,8 @@
+{
+  "rows": 640,
+  "only_final_norm_and_two_head_rows_loaded": true,
+  "max_absolute_difference": 0.125,
+  "mean_absolute_difference": 0.0001953125,
+  "within_original_0_05_tolerance_fraction": 0.9984375,
+  "interpretation": "Head-only reconstruction verifies saved final residual readout; it does not validate CPU full-model replay."
+}

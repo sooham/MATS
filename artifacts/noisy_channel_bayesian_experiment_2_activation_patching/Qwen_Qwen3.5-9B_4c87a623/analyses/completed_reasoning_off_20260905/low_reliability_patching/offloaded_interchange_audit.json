@@ -1,0 +1,90 @@
+{
+  "status": {
+    "complete": true,
+    "records": 384,
+    "interchange_records": 192,
+    "self_patch_records": 192,
+    "peak_allocated_mib": 2202.81982421875,
+    "peak_reserved_mib": 2234.0,
+    "after": {
+      "total_mib": 32607,
+      "free_mib": 10025,
+      "utilization_percent": 67,
+      "owners": {
+        "273484": 642,
+        "326499": 18568,
+        "411454": 2856
+      }
+    },
+    "existing_processes_modified": false
+  },
+  "setup": {
+    "cpu_offload": true,
+    "dtype": "bfloat16",
+    "cuda_allocator_limit_mib": 6144,
+    "before": {
+      "total_mib": 32607,
+      "free_mib": 12887,
+      "utilization_percent": 0,
+      "owners": {
+        "273484": 642,
+        "326499": 18568
+      }
+    },
+    "existing_processes_modified": false,
+    "capture_replay": "full saved sequence; score at answer_boundary_input_index",
+    "design_sha256": "a36b8af3588263449b49626227600d75a3aaa8b1ac4a47b8e5eebf3a9a895848",
+    "pid": 411454
+  },
+  "compatibility": {
+    "records": [
+      {
+        "row_id": "47f89f048506582277f19c76",
+        "reliability": "1/20",
+        "saved_margin": -0.5,
+        "replayed_margin": -0.5,
+        "absolute_difference": 0.0,
+        "seconds": 6.305318110622466
+      },
+      {
+        "row_id": "5b2ad9b4d2b0c9091d39e718",
+        "reliability": "19/20",
+        "saved_margin": 0.375,
+        "replayed_margin": 0.375,
+        "absolute_difference": 0.0,
+        "seconds": 4.207574434578419
+      },
+      {
+        "row_id": "7de3591a1f3137350ac38670",
+        "reliability": "1/4",
+        "saved_margin": -0.25,
+        "replayed_margin": -0.25,
+        "absolute_difference": 0.0,
+        "seconds": 2.5638455357402563
+      },
+      {
+        "row_id": "624aace20f7a58781c6055da",
+        "reliability": "3/4",
+        "saved_margin": 0.375,
+        "replayed_margin": 0.375,
+        "absolute_difference": 0.0,
+        "seconds": 1.982319981791079
+      }
+    ],
+    "complete": true,
+    "compatible": true,
+    "tolerance": 0.05,
+    "peak_allocated_mib": 2202.81982421875,
+    "peak_reserved_mib": 2234.0
+  },
+  "records": 384,
+  "interchange_records": 192,
+  "self_patch_records": 192,
+  "max_self_patch_absolute_change": 0.0,
+  "expected_interchange_records": 192,
+  "expected_self_patch_records": 192,
+  "non_tie_choice_changes": 0,
+  "non_tie_original_task_repairs": 0,
+  "non_tie_original_task_harms": 0,
+  "answers_exact_same_reliability_followup": false
+}

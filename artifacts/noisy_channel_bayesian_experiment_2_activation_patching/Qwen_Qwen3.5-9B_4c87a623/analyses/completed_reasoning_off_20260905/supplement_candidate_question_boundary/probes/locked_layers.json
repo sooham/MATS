@@ -1,0 +1,39 @@
+{
+  "probe_config_fingerprint": "94deb694dd14359ba2547f1bed3c7d80ed5c54111c9d8e081f557be0ef274f55",
+  "layers": {
+    "reasoning_off": {
+      "candidate_question_boundary": {
+        "delta_a": [
+          18,
+          17,
+          19
+        ],
+        "gain": [
+          3,
+          4,
+          1
+        ],
+        "gain_abs": [
+          3,
+          4,
+          2
+        ],
+        "z_bayes": [
+          18,
+          19,
+          21
+        ],
+        "z_heuristic": [
+          18,
+          17,
+          19
+        ],
+        "reliability_sign": [
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  }
+}

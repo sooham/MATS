@@ -1,0 +1,7 @@
+site,target,layer,best_cv_score,r2,auroc,row_count
+candidate_question_boundary,reliability_sign,1,1.0,,1.0,640
+candidate_question_boundary,gain,3,0.9949711133749968,0.9963763037828086,,640
+candidate_question_boundary,gain_abs,3,0.9984812846151117,0.9985251806927378,,640
+candidate_question_boundary,delta_a,18,0.47832538688579956,0.6150016814340485,,640
+candidate_question_boundary,z_bayes,18,0.002650288430192349,0.003119203502245038,,640
+candidate_question_boundary,z_heuristic,18,0.32634363857087745,0.4289426050473114,,640

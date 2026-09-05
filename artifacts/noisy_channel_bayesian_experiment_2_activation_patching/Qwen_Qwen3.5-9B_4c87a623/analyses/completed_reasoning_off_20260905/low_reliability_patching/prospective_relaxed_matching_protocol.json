@@ -1,0 +1,17 @@
+{
+  "status": "proposal_only_no_donors_selected_no_patches_run",
+  "preserved_fields": [
+    "reliabilities_exact",
+    "observed_reports",
+    "presentation_order",
+    "candidate_1",
+    "candidate_2",
+    "reasoning",
+    "agreement_candidate_1_by_question",
+    "agreement_candidate_2_by_question"
+  ],
+  "relaxed_field_requires_user_choice": "exact question membership sets",
+  "same_bayesian_pairwise_log_odds": true,
+  "counts_are_dependent_pairs_not_independent_samples": true,
+  "interpretation": "Preserves each candidate evidence pattern, not just agreement totals; changing distractor set members can still change representations."
+}

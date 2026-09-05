@@ -1,0 +1,43 @@
+{
+  "device": "cpu",
+  "dtype": "float32",
+  "saved_capture_dtype": "bfloat16",
+  "tolerance_from_notebook16": 0.05,
+  "records": [
+    {
+      "row_id": "47f89f048506582277f19c76",
+      "reliability": "1/20",
+      "cpu_margin": -0.44823265075683594,
+      "saved_margin": -0.5,
+      "absolute_difference": 0.05176734924316406,
+      "seconds": 22.860861403867602
+    },
+    {
+      "row_id": "5b2ad9b4d2b0c9091d39e718",
+      "reliability": "19/20",
+      "cpu_margin": 0.4062633514404297,
+      "saved_margin": 0.375,
+      "absolute_difference": 0.03126335144042969,
+      "seconds": 22.803017265163362
+    },
+    {
+      "row_id": "7de3591a1f3137350ac38670",
+      "reliability": "1/4",
+      "cpu_margin": -0.2006855010986328,
+      "saved_margin": -0.25,
+      "absolute_difference": 0.04931449890136719,
+      "seconds": 25.65394234377891
+    },
+    {
+      "row_id": "624aace20f7a58781c6055da",
+      "reliability": "3/4",
+      "cpu_margin": 0.4174385070800781,
+      "saved_margin": 0.375,
+      "absolute_difference": 0.042438507080078125,
+      "seconds": 26.838153939694166
+    }
+  ],
+  "complete": true,
+  "compatible": false,
+  "gpu_used": false
+}

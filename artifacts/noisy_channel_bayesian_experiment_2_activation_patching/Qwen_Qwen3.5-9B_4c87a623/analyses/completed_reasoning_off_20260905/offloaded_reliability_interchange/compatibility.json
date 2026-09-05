@@ -1,0 +1,41 @@
+{
+  "records": [
+    {
+      "row_id": "47f89f048506582277f19c76",
+      "reliability": "1/20",
+      "saved_margin": -0.5,
+      "replayed_margin": -0.5,
+      "absolute_difference": 0.0,
+      "seconds": 6.305318110622466
+    },
+    {
+      "row_id": "5b2ad9b4d2b0c9091d39e718",
+      "reliability": "19/20",
+      "saved_margin": 0.375,
+      "replayed_margin": 0.375,
+      "absolute_difference": 0.0,
+      "seconds": 4.207574434578419
+    },
+    {
+      "row_id": "7de3591a1f3137350ac38670",
+      "reliability": "1/4",
+      "saved_margin": -0.25,
+      "replayed_margin": -0.25,
+      "absolute_difference": 0.0,
+      "seconds": 2.5638455357402563
+    },
+    {
+      "row_id": "624aace20f7a58781c6055da",
+      "reliability": "3/4",
+      "saved_margin": 0.375,
+      "replayed_margin": 0.375,
+      "absolute_difference": 0.0,
+      "seconds": 1.982319981791079
+    }
+  ],
+  "complete": true,
+  "compatible": true,
+  "tolerance": 0.05,
+  "peak_allocated_mib": 2202.81982421875,
+  "peak_reserved_mib": 2234.0
+}

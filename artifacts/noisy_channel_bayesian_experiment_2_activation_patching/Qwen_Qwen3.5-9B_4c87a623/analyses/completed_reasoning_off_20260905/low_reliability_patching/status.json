@@ -1,0 +1,18 @@
+{
+  "exact_followup_status": "no_eligible_pairs",
+  "exact_pair_count": 0,
+  "reliability_interchange_design_directions": 64,
+  "cpu_parity_complete": true,
+  "cpu_compatible": false,
+  "cpu_bf16_compatible": false,
+  "cpu_full_capture_replay_complete": true,
+  "cpu_full_capture_compatible": false,
+  "gpu_used": true,
+  "causal_rescue_measured": false,
+  "notebook_kernel_uses_gpu": false,
+  "reliability_interchange_measured": true,
+  "reliability_interchange_complete": true,
+  "exact_same_reliability_rescue_measured": false,
+  "causal_rescue_field_scope": "exact same-reliability clean/incorrect follow-up",
+  "full_experiment2_causal_controls_complete": false
+}

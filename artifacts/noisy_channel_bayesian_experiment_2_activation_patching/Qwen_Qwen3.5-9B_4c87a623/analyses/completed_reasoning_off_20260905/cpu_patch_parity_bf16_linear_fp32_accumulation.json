@@ -1,0 +1,59 @@
+{
+  "device": "cpu",
+  "dtype": "bf16_linear_fp32_accumulation",
+  "saved_capture_dtype": "bfloat16",
+  "tolerance_from_notebook16": 0.05,
+  "records": [
+    {
+      "row_id": "47f89f048506582277f19c76",
+      "reliability": "1/20",
+      "cpu_logits": [
+        22.375,
+        22.875
+      ],
+      "cpu_margin": -0.5,
+      "saved_margin": -0.5,
+      "absolute_difference": 0.0,
+      "seconds": 25.60543802473694
+    },
+    {
+      "row_id": "5b2ad9b4d2b0c9091d39e718",
+      "reliability": "19/20",
+      "cpu_logits": [
+        23.0,
+        22.625
+      ],
+      "cpu_margin": 0.375,
+      "saved_margin": 0.375,
+      "absolute_difference": 0.0,
+      "seconds": 25.945695389062166
+    },
+    {
+      "row_id": "7de3591a1f3137350ac38670",
+      "reliability": "1/4",
+      "cpu_logits": [
+        22.75,
+        22.875
+      ],
+      "cpu_margin": -0.125,
+      "saved_margin": -0.25,
+      "absolute_difference": 0.125,
+      "seconds": 28.912096607498825
+    },
+    {
+      "row_id": "624aace20f7a58781c6055da",
+      "reliability": "3/4",
+      "cpu_logits": [
+        23.125,
+        22.625
+      ],
+      "cpu_margin": 0.5,
+      "saved_margin": 0.375,
+      "absolute_difference": 0.125,
+      "seconds": 22.691927455365658
+    }
+  ],
+  "complete": true,
+  "compatible": false,
+  "gpu_used": false
+}
