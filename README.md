@@ -119,28 +119,9 @@ resumes safely through the Hugging Face cache.
 
 ## Experiments
 
-- `notebooks/01_minimal_noisy_source.ipynb` generates scripted noisy-source transcripts, computes exact Bayesian posteriors, and evaluates Qwen3.5-4B with forced-choice candidate and half-domain probes. Its final section verifies the selected honest single-call candidate probe.
-- `notebooks/02_fixed_transcript_reliability_sweep.ipynb` replays an exhaustive bank of identical question/answer histories under every reliability condition, separating controlled reliability sensitivity from exact natural-distribution-weighted performance.
-- `notebooks/03_controlled_posterior_behavior.ipynb` implements the behavioral gate: an explicit elicitation control, a counterfactually paired N=2/N=4 ladder, and a 32-schedule N=8 fixed bank. Its primary continuous target is exact posterior log-odds; left/right/tie classification, surface heuristics, tie subtypes, role/vocabulary/number-format robustness, and schedule-clustered uncertainty are reported separately.
-- `notebooks/04_raw_evidence_deliberation_probe.ipynb` records an earlier failed single-call search and a historical multi-stage scaffold. The multi-stage result is excluded from the current estimand.
-- `notebooks/05_single_call_candidate_probe.ipynb` develops the replacement candidate-number readout under the same N=8, K=3 random-memoryless game. It uses exactly one no-thinking Qwen continuation per transcript and only public rules plus raw questions/reports. The frozen method scores 52/56 on development, 47/56 on validation, and 107/112 (95.5%) on held-out repeats 2–3 with 100% parse compliance.
-- `notebooks/06_exact_filler_token_sweep.ipynb` evaluates exact token-ID filler prefixes for every F=0–100 across five single-token identities, then reports one frozen repeat-1 validation condition.
-- `notebooks/07_scaled_filler_grid.ipynb` crosses eight domain sizes with all eleven reliability values while exactly counterbalancing candidate order and X/Y answer aliases within each cell.
-- `notebooks/08_filler_alias_mechanism.ipynb` uses a causal X/Y alias swap and a 33-depth logit lens to distinguish semantic candidate selection from answer-token bias.
-- `notebooks/09_qwen35_model_size_comparison.ipynb` compares the frozen notebook-05 prompt, the full notebook-06 filler grid, and a held-out zero-scratchpad `F=0` readout across pinned Qwen3.5-4B, Qwen3.5-9B, and Qwen3.5-27B-GPTQ-Int4 checkpoints.
-- `notebooks/10_qwen35_candidate_readout_thinking_budget.ipynb` consolidates the original label probe, visible-deliberation result, zero-generated-reasoning controls, and the historical native-thinking comparison.
-- `notebooks/11_noisy_channel_bayesian_framework.ipynb` introduces the exact, exhaustive noisy-channel dataset and paired candidate-evidence control used by the later reliability experiments.
-- `notebooks/12_noisy_channel_bayesian_agreement_logits.ipynb` measures order-balanced candidate logits for Qwen3.5-4B and 9B at reliability 9/10, with and without an ordinary visible explanation.
 - `notebooks/13_noisy_channel_bayesian_agreement_logits.ipynb` replays identical exhaustive evidence across reliability 0/10, 1/10, 5/10, 9/10, and 10/10. It shows that 9B's immediate answer margin tracks agreement with the source even below reliability 1/2, while visible explanation restores the required sign inversion. Both conditions disable native Qwen thinking.
 
 Reproduce the frozen single-call held-out result with:
-
-```bash
-uv run --frozen python scripts/run_single_call_candidate.py \
-  --output artifacts/single_call_candidate/test_system_reason_results.jsonl \
-  --manifest artifacts/single_call_candidate/test_system_reason_manifest.json \
-  --repeats 2,3 --variant number_system_reason --batch-size 4 --overwrite
-```
 
 The runner hardcodes `enable_thinking=False`. Candidate presentation order is
 derived from the public example ID rather than the target, and evaluator-derived
@@ -149,11 +130,3 @@ messages. At exactly `r=0.5`, all candidate posteriors tie, so three-way argmax
 accuracy need not decrease even though the observations contain no information;
 posterior effect size is the appropriate entropy-sensitive target.
 
-Primary papers that materially affect experiment design or interpretation are maintained as an
-annotated ledger in [`CITATIONS.md`](CITATIONS.md).
-
-The proposed mechanistic follow-up—three ranked hypotheses, exact causal interventions, failure
-criteria, and an RTX-5090/Qwen3.5 execution plan—is in
-[`reports/research_agenda/REPORT.md`](reports/research_agenda/REPORT.md).
-The focused notebook-13 interpretation and revised reliability-sign-gate experiment ladder are in
-[`reports/research_agenda/NOTEBOOK13_UPDATE.md`](reports/research_agenda/NOTEBOOK13_UPDATE.md).
