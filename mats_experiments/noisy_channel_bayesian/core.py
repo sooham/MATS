@@ -8,216 +8,36 @@ model execution lives in :mod:`runner`.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
-import math
-import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Literal
 
+from .constants import NO, SOFTMAX_LOG_BASE, SOFTMAX_LOG_UNIT, YES
+from .env import CandidateEvidenceBayesianEnvironment, NoisyChannelBayesianEnvironment
+from .probes import XVsYPosteriorProbe, _posterior_target_fields
+from .questions import CandidateEvidenceQuestion
+from .utils import (
+    SystemPrompt,
+    _format_set,
+    as_fraction,
+    candidate_agreements,
+    exact_bayesian_target,
+    fraction_text,
+    initial_messages,
+    natural_log_ratio,
+    reliability_surface,
+)
+
 SCHEMA_VERSION = "1.0"
-YES = "YES"
-NO = "NO"
-
-# Qwen returns unnormalized pre-softmax scores, so individual raw logits do not
-# have a logarithm base.  PyTorch's softmax uses exp(), however, which makes
-# log-probabilities and logit differences natural-log quantities (nats).
-SOFTMAX_LOG_BASE = "e"
-SOFTMAX_LOG_UNIT = "nats"
-
-
-def as_fraction(value: float | str | Fraction) -> Fraction:
-    """Convert a public reliability value without introducing binary-float noise."""
-
-    if isinstance(value, Fraction):
-        result = value
-    elif isinstance(value, float):
-        result = Fraction(str(value))
-    else:
-        result = Fraction(value)
-    if not 0 <= result <= 1:
-        raise ValueError(f"Reliability must lie in [0, 1], got {value!r}.")
-    return result
-
-
-def fraction_text(value: Fraction) -> str:
-    return f"{value.numerator}/{value.denominator}"
-
-
-def natural_log_ratio(numerator: Fraction, denominator: Fraction) -> float:
-    """Return ln(numerator / denominator) on PyTorch softmax's logit scale.
-
-    Computing the two integer logarithms separately preserves the exact rational
-    ratio until the final floating-point operation and avoids an intermediate
-    ``float(Fraction)`` overflow for unusually large exact values.
-    """
-
-    if numerator <= 0 or denominator <= 0:
-        raise ValueError("A finite natural-log ratio requires positive values.")
-    ratio = numerator / denominator
-    return math.log(ratio.numerator) - math.log(ratio.denominator)
-
-
-@dataclass(frozen=True)
-class NoisyChannelBayesianEnvironment:
-    """Finite uniform domain and the reliability of each observed report."""
-
-    n: int = 8
-    k: int = 3
-    r_values: int | float | str | Fraction | Sequence[int | float | str | Fraction] = Fraction(3, 4)
-    control_positional_bias: bool = False
-
-    def __post_init__(self) -> None:
-        if self.n < 1:
-            raise ValueError("n must be positive.")
-        if self.k < 1:
-            raise ValueError("k must be positive.")
-        if not isinstance(self.control_positional_bias, bool):
-            raise TypeError("control_positional_bias must be a bool.")
-        values = self.r_values
-        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-            resolved = tuple(as_fraction(value) for value in values)
-            if len(resolved) != self.k:
-                raise ValueError(f"Expected {self.k} reliability values, got {len(resolved)}.")
-            shared = False
-        else:
-            resolved = (as_fraction(values),) * self.k
-            shared = True
-        object.__setattr__(self, "_reliabilities", resolved)
-        object.__setattr__(self, "_shared_reliability", shared)
-
-    @property
-    def domain(self) -> tuple[int, ...]:
-        return tuple(range(1, self.n + 1))
-
-    @property
-    def reliabilities(self) -> tuple[Fraction, ...]:
-        return self._reliabilities  # type: ignore[attr-defined]
-
-    @property
-    def shared_reliability(self) -> bool:
-        return self._shared_reliability  # type: ignore[attr-defined]
-
-
-@dataclass(frozen=True)
-class CandidateEvidenceBayesianEnvironment(NoisyChannelBayesianEnvironment):
-    """The same channel model presented through candidate-specific evidence relations."""
-
-
-@dataclass(frozen=True)
-class CandidateEvidenceQuestion:
-    """Presentation contract for the reduced, set-membership-free control."""
-
-    agreement_surface: str = "AGREES"
-    disagreement_surface: str = "DISAGREES"
-    reliability_format: Literal["decimal_or_exact_fraction"] = "decimal_or_exact_fraction"
-    layout: Literal["grouped_by_candidate"] = "grouped_by_candidate"
-
-    def __post_init__(self) -> None:
-        if not self.agreement_surface.strip() or not self.disagreement_surface.strip():
-            raise ValueError("Candidate-evidence relation surfaces must not be empty.")
-        if self.agreement_surface.strip() == self.disagreement_surface.strip():
-            raise ValueError("Agreement and disagreement surfaces must be distinct.")
-        if self.reliability_format != "decimal_or_exact_fraction":
-            raise ValueError("Unsupported candidate-evidence reliability format.")
-        if self.layout != "grouped_by_candidate":
-            raise ValueError("Unsupported candidate-evidence layout.")
-
-
-@dataclass(frozen=True)
-class RandomSubsetQuestion:
-    """Draw one subset independently for every question in a schedule."""
-
-    subset_size: int = 4
-    replacement: bool = False
-    sort: bool = True
-
-    def validate(self, n: int) -> None:
-        if self.subset_size < 1:
-            raise ValueError("subset_size must be positive.")
-        if not self.replacement and self.subset_size > n:
-            raise ValueError("subset_size cannot exceed n without replacement.")
-
-    def sample(self, *, rng: random.Random, n: int, k: int) -> list[dict[str, object]]:
-        self.validate(n)
-        domain = list(range(1, n + 1))
-        result: list[dict[str, object]] = []
-        for _ in range(k):
-            raw = (
-                [rng.choice(domain) for _ in range(self.subset_size)]
-                if self.replacement
-                else rng.sample(domain, self.subset_size)
-            )
-            unique = list(dict.fromkeys(raw))
-            membership = sorted(unique) if self.sort else unique
-            result.append({"raw_draws": raw, "membership_set": membership})
-        return result
-
-
-@dataclass(frozen=True)
-class FixedSubsetQuestion:
-    """A single, explicitly supplied question schedule."""
-
-    subsets: Sequence[Sequence[int]]
-
-    def sample(self, *, rng: random.Random, n: int, k: int) -> list[dict[str, object]]:
-        del rng
-        if len(self.subsets) != k:
-            raise ValueError(f"Expected {k} fixed subsets, got {len(self.subsets)}.")
-        result: list[dict[str, object]] = []
-        for subset in self.subsets:
-            raw = list(subset)
-            if not raw:
-                raise ValueError("Fixed subsets must not be empty.")
-            if any(not isinstance(value, int) or not 1 <= value <= n for value in raw):
-                raise ValueError(f"Fixed subset values must be integers in 1..{n}.")
-            if len(set(raw)) != len(raw):
-                raise ValueError("Fixed subsets may not contain duplicate values.")
-            result.append({"raw_draws": raw, "membership_set": raw})
-        return result
-
-
-CallLayout = Literal["conversation", "replay_user"]
-
-
-@dataclass(frozen=True)
-class XVsYPosteriorProbe:
-    x: int = 2
-    y: int = 7
-    reasoning: bool = False
-    allow_same: bool = False
-    call_layout: CallLayout = "conversation"
-    answer_prefix: str = "ANSWER:"
-
-    def validate(self, n: int) -> None:
-        if self.x == self.y:
-            raise ValueError("x and y must be distinct; allow_same only controls tie answers.")
-        if self.x not in range(1, n + 1) or self.y not in range(1, n + 1):
-            raise ValueError(f"x and y must both lie in 1..{n}.")
-        if not isinstance(self.reasoning, bool):
-            raise TypeError("reasoning must be a bool.")
-        if self.call_layout not in ("conversation", "replay_user"):
-            raise ValueError("call_layout must be 'conversation' or 'replay_user'.")
-        if (
-            not self.answer_prefix
-            or self.answer_prefix != self.answer_prefix.strip()
-            or "\n" in self.answer_prefix
-        ):
-            raise ValueError(
-                "answer_prefix must be non-empty, single-line, and have no surrounding whitespace."
-            )
-
-
-@dataclass(frozen=True)
-class SystemPrompt:
-    content: str | None = None
-
 
 @dataclass(frozen=True)
 class TokenizerBinding:
-    """Bind generation to one tokenizer and its exact chat-template serialization."""
+    """
+    Bind generation to one tokenizer and its exact chat-template serialization.
+    VERIFIED
+    """
 
     tokenizer: Any
     enable_thinking: bool = False
@@ -232,11 +52,7 @@ class TokenizerBinding:
 
     def apply(self, messages: Sequence[Mapping[str, str]], *, tokenize: bool) -> Any:
         kwargs = self._template_kwargs(tokenize=tokenize)
-        try:
-            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
-        except TypeError:
-            kwargs.pop("enable_thinking")
-            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        return self.tokenizer.apply_chat_template(list(messages), **kwargs)
 
     def serialize(self, messages: Sequence[Mapping[str, str]]) -> str:
         rendered = self.apply(messages, tokenize=False)
@@ -268,84 +84,6 @@ class TokenizerBinding:
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def answer_patterns(k: int) -> list[tuple[str, ...]]:
-    """Stable exhaustive order: YES precedes NO at every position."""
-
-    return list(itertools.product((YES, NO), repeat=k))
-
-
-def exact_bayesian_target(
-    *,
-    domain: Sequence[int],
-    membership_sets: Sequence[Sequence[int]],
-    reports: Sequence[str],
-    reliabilities: Sequence[Fraction],
-) -> tuple[Fraction, dict[int, Fraction] | None]:
-    """Return prior-predictive evidence and the exact posterior, if defined."""
-
-    if not (len(membership_sets) == len(reports) == len(reliabilities)):
-        raise ValueError("Questions, reports, and reliabilities must have equal lengths.")
-    if not domain:
-        raise ValueError("domain must not be empty.")
-    likelihoods: dict[int, Fraction] = {}
-    set_views = [set(values) for values in membership_sets]
-    for candidate in domain:
-        likelihood = Fraction(1)
-        for membership, report, reliability in zip(set_views, reports, reliabilities):
-            if report not in (YES, NO):
-                raise ValueError(f"Unknown report {report!r}.")
-            expected = YES if candidate in membership else NO
-            likelihood *= reliability if report == expected else 1 - reliability
-        likelihoods[candidate] = likelihood
-    total = sum(likelihoods.values(), Fraction(0))
-    evidence = total / len(domain)
-    if total == 0:
-        return evidence, None
-    return evidence, {candidate: value / total for candidate, value in likelihoods.items()}
-
-
-def candidate_agreements(
-    *,
-    membership_sets: Sequence[Sequence[int]],
-    reports: Sequence[str],
-    candidate: int,
-) -> list[int]:
-    """Return per-question agreement between a candidate and the observed reports."""
-
-    if len(membership_sets) != len(reports):
-        raise ValueError("membership_sets and reports must have equal lengths.")
-    flags: list[int] = []
-    for membership, report in zip(membership_sets, reports):
-        if report not in (YES, NO):
-            raise ValueError(f"Unknown report {report!r}.")
-        predicted_report = YES if candidate in set(membership) else NO
-        flags.append(int(report == predicted_report))
-    return flags
-
-
-def reliability_surface(value: Fraction) -> str:
-    """Render a reliability exactly, preferring a terminating decimal when possible."""
-
-    denominator = value.denominator
-    twos = 0
-    fives = 0
-    while denominator % 2 == 0:
-        denominator //= 2
-        twos += 1
-    while denominator % 5 == 0:
-        denominator //= 5
-        fives += 1
-    if denominator != 1:
-        return fraction_text(value)
-    digits = max(twos, fives)
-    if digits == 0:
-        return str(value.numerator)
-    scaled = value.numerator * 10**digits // value.denominator
-    text = str(abs(scaled)).rjust(digits + 1, "0")
-    sign = "-" if scaled < 0 else ""
-    return f"{sign}{text[:-digits]}.{text[-digits:]}"
-
-
 def derive_candidate_evidence(
     *,
     membership_sets: Sequence[Sequence[int]],
@@ -354,7 +92,10 @@ def derive_candidate_evidence(
     probe: XVsYPosteriorProbe,
     question: CandidateEvidenceQuestion,
 ) -> dict[str, dict[str, object]]:
-    """Project raw membership observations into pairwise sufficient evidence."""
+    """
+    Project raw membership observations into pairwise sufficient evidence.
+    VERIFIED
+    """
 
     if not (len(membership_sets) == len(reports) == len(reliabilities)):
         raise ValueError("Questions, reports, and reliabilities must have equal lengths.")
@@ -390,6 +131,7 @@ def derive_candidate_evidence(
 def _final_answer_format_lines(
     *, probe: XVsYPosteriorProbe, allowed_values: Sequence[str]
 ) -> list[str]:
+    """VERIFIED"""
     return [
         "FINAL-ANSWER FORMAT:",
         "End your response with exactly one of these lines:",
@@ -407,7 +149,10 @@ def render_candidate_evidence_prompt(
     probe: XVsYPosteriorProbe,
     question: CandidateEvidenceQuestion,
 ) -> str:
-    """Render the reduced control without accepting raw questions or reports."""
+    """
+    Render the reduced control without accepting raw questions or reports.
+    VERIFIED
+    """
 
     lines = [
         f"A value s is uniformly distributed over the integers 1 through {n}.",
@@ -463,10 +208,6 @@ def render_candidate_evidence_prompt(
     return "\n".join(lines)
 
 
-def _format_set(values: Sequence[int]) -> str:
-    return "{" + ", ".join(str(value) for value in values) + "}"
-
-
 def render_observable_prompt(
     *,
     n: int,
@@ -477,7 +218,10 @@ def render_observable_prompt(
     probe: XVsYPosteriorProbe,
     stage: Literal["answer", "reasoning"],
 ) -> str:
-    """Render exclusively from fields available to an observer of the transcript."""
+    """
+    Render exclusively from fields available to an observer of the transcript.
+    VERIFIED
+    """
 
     lines = [
         "A secret integer s was sampled uniformly from the displayed domain.",
@@ -598,53 +342,12 @@ def render_observable_prompt(
     return "\n".join(lines)
 
 
-def initial_messages(
-    *, observable_prompt: str, system_prompt: SystemPrompt
-) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    if system_prompt.content:
-        messages.append({"role": "system", "content": system_prompt.content})
-    messages.append({"role": "user", "content": observable_prompt})
-    return messages
-
-
-@dataclass(frozen=True)
-class CaptureSpec:
-    """Tensor capture policy.
-
-    ``logits_scope="answer_surfaces"`` stores only the resolved X/Y token logits
-    inline in each result.  Full scope persists vocabulary tensors; ``logit_tokens``
-    selects prompt positions, while ``every_decode_position`` switches capture to
-    every generated position.  Activation ``tokens`` are selected independently.
-    The special value ``"row_selected"`` reads an ``activation_token_selector``
-    selector from each dataset row, enabling sparse semantically aligned capture.
-    """
-
-    logits_boundaries: tuple[str, ...] = ()
-    logits_scope: Literal["full", "answer_surfaces"] = "full"
-    logit_tokens: object = "last"
-    streams: tuple[str, ...] = ()
-    layers: object = "all"
-    tokens: object = "last"
-    every_decode_position: bool = False
-
-    def __post_init__(self) -> None:
-        if not set(self.logits_boundaries) <= {"answer"}:
-            raise ValueError("logits_boundaries may contain only 'answer'.")
-        if self.logits_scope not in {"full", "answer_surfaces"}:
-            raise ValueError("logits_scope must be 'full' or 'answer_surfaces'.")
-        valid_streams = {"resid_pre", "token_mixer_out", "mlp_out", "resid_post"}
-        if not set(self.streams) <= valid_streams:
-            raise ValueError(f"Unknown activation stream: {set(self.streams) - valid_streams}")
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.logits_boundaries or self.streams or self.every_decode_position)
-
-
 @dataclass(frozen=True)
 class MetricSpec:
-    """Answer scoring surfaces; omitted X/Y surfaces resolve from each row's probe."""
+    """
+    Answer scoring surfaces; omitted X/Y surfaces resolve from each row's probe.
+    VERIFIED
+    """
 
     x_surface: str | None = None
     y_surface: str | None = None
@@ -677,62 +380,6 @@ def stable_row_id(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()[:24]
 
 
-def _posterior_target_fields(
-    *,
-    posterior: Mapping[int, Fraction] | None,
-    probe: XVsYPosteriorProbe,
-) -> dict[str, object]:
-    if posterior is None:
-        return {
-            "posterior_exact": None,
-            "posterior": None,
-            "x_posterior_exact": None,
-            "y_posterior_exact": None,
-            "x_posterior": None,
-            "y_posterior": None,
-            "posterior_difference": None,
-            "posterior_log_odds": None,
-            "posterior_log_odds_base": SOFTMAX_LOG_BASE,
-            "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
-            "ground_truth_choice": None,
-            "normative_comparison": None,
-        }
-    x_probability = posterior[probe.x]
-    y_probability = posterior[probe.y]
-    if x_probability > y_probability:
-        comparison = "X"
-    elif y_probability > x_probability:
-        comparison = "Y"
-    else:
-        comparison = "SAME"
-    ground_truth = comparison if comparison != "SAME" or probe.allow_same else None
-    if x_probability > 0 and y_probability > 0:
-        log_odds: float | None = natural_log_ratio(x_probability, y_probability)
-    elif x_probability == y_probability:
-        log_odds = 0.0
-    else:
-        log_odds = None
-    return {
-        "posterior_exact": {
-            str(candidate): fraction_text(probability)
-            for candidate, probability in posterior.items()
-        },
-        "posterior": {
-            str(candidate): float(probability) for candidate, probability in posterior.items()
-        },
-        "x_posterior_exact": fraction_text(x_probability),
-        "y_posterior_exact": fraction_text(y_probability),
-        "x_posterior": float(x_probability),
-        "y_posterior": float(y_probability),
-        "posterior_difference": float(x_probability - y_probability),
-        "posterior_log_odds": log_odds,
-        "posterior_log_odds_base": SOFTMAX_LOG_BASE,
-        "posterior_log_odds_unit": SOFTMAX_LOG_UNIT,
-        "ground_truth_choice": ground_truth,
-        "normative_comparison": comparison,
-    }
-
-
 def _canonical_candidate_target_fields(
     *,
     posterior: Mapping[int, Fraction] | None,
@@ -740,7 +387,10 @@ def _canonical_candidate_target_fields(
     candidate_2: int,
     allow_same: bool,
 ) -> dict[str, object]:
-    """Posterior fields whose C1/C2 orientation is invariant to presentation order."""
+    """
+    Posterior fields whose C1/C2 orientation is invariant to presentation order.
+    VERIFIED
+    """
 
     if posterior is None:
         return {
@@ -797,7 +447,10 @@ def build_candidate_evidence_row(
     system_prompt: SystemPrompt,
     tokenizer_binding: TokenizerBinding,
 ) -> dict[str, object]:
-    """Build one reduced row while retaining the raw transcript for auditing only."""
+    """
+    Build one reduced row while retaining the raw transcript for auditing only.
+    VERIFIED
+    """
 
     if source_row.get("representation") == "candidate_evidence":
         raise ValueError("Candidate-evidence rows cannot be projected a second time.")

@@ -16,13 +16,13 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from .capture_spec import CaptureSpec
+from .constants import SOFTMAX_LOG_BASE, SOFTMAX_LOG_UNIT
 from .core import (
-    SOFTMAX_LOG_BASE,
-    SOFTMAX_LOG_UNIT,
-    CaptureSpec,
     MetricSpec,
     TokenizerBinding,
 )
@@ -1099,7 +1099,7 @@ class QwenRunner:
             prefix_lengths.append(len(prefix))
         if prefix_lengths[-1] != len(text):
             return None
-        return list(zip(prefix_lengths[:-1], prefix_lengths[1:], strict=True))
+        return list(pairwise(prefix_lengths))
 
     @staticmethod
     def _token_boundary_from_offsets(

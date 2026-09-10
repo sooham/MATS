@@ -14,19 +14,25 @@ from typing import Any, overload
 
 from .core import (
     SCHEMA_VERSION,
-    CandidateEvidenceBayesianEnvironment,
-    CandidateEvidenceQuestion,
-    FixedSubsetQuestion,
-    NoisyChannelBayesianEnvironment,
-    RandomSubsetQuestion,
-    SystemPrompt,
     TokenizerBinding,
-    XVsYPosteriorProbe,
-    answer_patterns,
     build_candidate_evidence_row,
     build_row,
     stable_row_id,
 )
+from .env import (
+    CandidateEvidenceBayesianEnvironment,
+    NoisyChannelBayesianEnvironment,
+)
+from .probes import XVsYPosteriorProbe
+from .questions import (
+    AgreementSubsetQuestion,
+    CandidateEvidenceQuestion,
+    FixedSubsetQuestion,
+    RandomSubsetQuestion,
+    agreement_pattern_text,
+    agreement_patterns,
+)
+from .utils import SystemPrompt, answer_patterns
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -254,7 +260,13 @@ def _environment_manifest(environment: NoisyChannelBayesianEnvironment) -> dict[
     }
 
 
-def _question_manifest(question: RawQuestion) -> dict[str, object]:
+def _question_manifest(question: RawQuestion | AgreementSubsetQuestion) -> dict[str, object]:
+    if isinstance(question, AgreementSubsetQuestion):
+        return {
+            "type": type(question).__name__,
+            "subset_size": question.subset_size,
+            "sort": question.sort,
+        }
     if isinstance(question, RandomSubsetQuestion):
         return {
             "type": type(question).__name__,
@@ -430,6 +442,272 @@ class TranscriptDatasetGenerator:
             ),
             "n": _common_or_none([value.n for value in environments]),
             "k": _common_or_none([value.k for value in environments]),
+            "reliabilities_exact": _common_or_none(
+                [list(item["reliabilities_exact"]) for item in environment_manifests]
+            ),
+            "question_type": _common_or_none(
+                [str(item["type"]) for item in question_manifests]
+            ),
+            "probe": probe_manifests[0] if len(probe_manifests) == 1 else None,
+            "environments": environment_manifests,
+            "questions": question_manifests,
+            "probes": probe_manifests,
+            "reasoning_values": [probe.reasoning for probe in probes],
+            "parameterizations": parameterizations,
+            "system_prompt": self.system_prompt.content,
+            "tokenizer_template_fingerprint": self.tokenizer_binding.fingerprint,
+            "question_schedules": single_schedule_bank,
+            "question_schedule_banks": schedule_banks,
+        }
+        return TranscriptDataset(rows, manifest=manifest)
+
+
+@dataclass(frozen=True)
+class AgreementTranscriptDatasetGenerator:
+    """Generate uniform coverage of the Cartesian X/Y agreement-pattern grid.
+
+    ``num_question_sets`` is interpreted per agreement cell. For an environment
+    with ``k`` questions, generation covers all ``2**k`` patterns for canonical
+    candidate X crossed with all ``2**k`` patterns for canonical candidate Y.
+    Compatible question schedules are sampled once per environment/question pair
+    and reused for every probe value.
+    """
+
+    environment: NoisyChannelBayesianEnvironment | Sequence[NoisyChannelBayesianEnvironment]
+    question: AgreementSubsetQuestion | Sequence[AgreementSubsetQuestion]
+    probe: XVsYPosteriorProbe | Sequence[XVsYPosteriorProbe]
+    tokenizer_binding: TokenizerBinding
+    system_prompt: SystemPrompt = field(default_factory=SystemPrompt)
+    seed: int = 0
+
+    def generate(self, *, num_question_sets: int) -> TranscriptDataset:
+        if num_question_sets < 1:
+            raise ValueError("num_question_sets must be positive.")
+        environments = _parameter_axis(
+            self.environment,
+            expected_type=NoisyChannelBayesianEnvironment,
+            name="environment",
+        )
+        questions = _parameter_axis(
+            self.question,
+            expected_type=AgreementSubsetQuestion,
+            name="question",
+        )
+        probes = _parameter_axis(
+            self.probe,
+            expected_type=XVsYPosteriorProbe,
+            name="probe",
+        )
+
+        canonical_x, canonical_y = probes[0].x, probes[0].y
+        if any((probe.x, probe.y) != (canonical_x, canonical_y) for probe in probes):
+            raise ValueError(
+                "AgreementTranscriptDatasetGenerator requires every probe to use "
+                "the same ordered X/Y candidate pair."
+            )
+
+        rows: list[dict[str, object]] = []
+        parameterizations: list[dict[str, object]] = []
+        schedule_banks: list[dict[str, object]] = []
+        agreement_pattern_counts: list[int] = []
+        agreement_cell_counts: list[int] = []
+        total_question_set_counts: list[int] = []
+        presentation_counts: list[int] = []
+        parameterization_index = 0
+
+        for environment_index, environment in enumerate(environments):
+            patterns = agreement_patterns(environment.k)
+            pattern_count = len(patterns)
+            cell_count = pattern_count**2
+            total_question_sets = cell_count * num_question_sets
+            report_pattern_indices = {
+                reports: index for index, reports in enumerate(answer_patterns(environment.k))
+            }
+            agreement_pattern_counts.append(pattern_count)
+            agreement_cell_counts.append(cell_count)
+            total_question_set_counts.append(total_question_sets)
+            presentation_counts.append(2 if environment.control_positional_bias else 1)
+
+            for question_index, question in enumerate(questions):
+                question.validate(n=environment.n, x=canonical_x, y=canonical_y)
+                rng = random.Random(self.seed)
+                sampled_scenarios: list[dict[str, object]] = []
+                for x_pattern_index, x_pattern in enumerate(patterns):
+                    for y_pattern_index, y_pattern in enumerate(patterns):
+                        agreement_cell_index = x_pattern_index * pattern_count + y_pattern_index
+                        for agreement_question_set_index in range(num_question_sets):
+                            sampled_questions, reports = question.sample(
+                                rng=rng,
+                                n=environment.n,
+                                k=environment.k,
+                                x=canonical_x,
+                                y=canonical_y,
+                                x_agreements=x_pattern,
+                                y_agreements=y_pattern,
+                            )
+                            question_set_index = (
+                                agreement_cell_index * num_question_sets
+                                + agreement_question_set_index
+                            )
+                            sampled_scenarios.append(
+                                {
+                                    "question_set_index": question_set_index,
+                                    "agreement_cell_index": agreement_cell_index,
+                                    "agreement_question_set_index": (
+                                        agreement_question_set_index
+                                    ),
+                                    "agreement_x_pattern_index": x_pattern_index,
+                                    "agreement_y_pattern_index": y_pattern_index,
+                                    "agreement_x_pattern": agreement_pattern_text(x_pattern),
+                                    "agreement_y_pattern": agreement_pattern_text(y_pattern),
+                                    "target_agreement_x_by_question": list(x_pattern),
+                                    "target_agreement_y_by_question": list(y_pattern),
+                                    "questions": sampled_questions,
+                                    "reports": reports,
+                                }
+                            )
+
+                schedule_banks.append(
+                    {
+                        "environment_parameter_index": environment_index,
+                        "question_parameter_index": question_index,
+                        "agreement_target_x": canonical_x,
+                        "agreement_target_y": canonical_y,
+                        "question_schedules": [
+                            [
+                                list(sampled_question["membership_set"])
+                                for sampled_question in scenario["questions"]  # type: ignore[union-attr]
+                            ]
+                            for scenario in sampled_scenarios
+                        ],
+                        "agreement_scenarios": [
+                            {
+                                key: value
+                                for key, value in scenario.items()
+                                if key not in {"questions", "reports"}
+                            }
+                            | {"observed_reports": list(scenario["reports"])}
+                            for scenario in sampled_scenarios
+                        ],
+                    }
+                )
+
+                for probe_index, probe in enumerate(probes):
+                    probe.validate(environment.n)
+                    presented_probes = [(0, probe)]
+                    if environment.control_positional_bias:
+                        presented_probes.append((1, replace(probe, x=probe.y, y=probe.x)))
+                    parameterizations.append(
+                        {
+                            "parameterization_index": parameterization_index,
+                            "environment_parameter_index": environment_index,
+                            "question_parameter_index": question_index,
+                            "probe_parameter_index": probe_index,
+                            "environment": _environment_manifest(environment),
+                            "question": _question_manifest(question),
+                            "probe": _probe_manifest(probe),
+                            "agreement_cell_count": cell_count,
+                            "num_question_sets_per_agreement_cell": num_question_sets,
+                            "row_count": total_question_sets * len(presented_probes),
+                        }
+                    )
+
+                    for scenario in sampled_scenarios:
+                        reports = scenario["reports"]
+                        for presentation_index, presented_probe in presented_probes:
+                            row = build_row(
+                                environment=environment,
+                                questions=scenario["questions"],  # type: ignore[arg-type]
+                                question_set_index=int(scenario["question_set_index"]),
+                                reports=reports,  # type: ignore[arg-type]
+                                answer_pattern_index=report_pattern_indices[reports],  # type: ignore[index]
+                                probe=presented_probe,
+                                canonical_probe=probe,
+                                presentation_index=presentation_index,
+                                parameterization_index=parameterization_index,
+                                environment_parameter_index=environment_index,
+                                question_parameter_index=question_index,
+                                probe_parameter_index=probe_index,
+                                system_prompt=self.system_prompt,
+                                tokenizer_binding=self.tokenizer_binding,
+                            )
+                            target_x = scenario["target_agreement_x_by_question"]
+                            target_y = scenario["target_agreement_y_by_question"]
+                            if (
+                                row["agreement_candidate_1_by_question"] != target_x
+                                or row["agreement_candidate_2_by_question"] != target_y
+                            ):
+                                raise RuntimeError(
+                                    "Sampled questions do not realize their target agreement cell."
+                                )
+                            row.update(
+                                {
+                                    "agreement_target_x": canonical_x,
+                                    "agreement_target_y": canonical_y,
+                                    "agreement_cell_index": scenario["agreement_cell_index"],
+                                    "agreement_question_set_index": scenario[
+                                        "agreement_question_set_index"
+                                    ],
+                                    "agreement_x_pattern_index": scenario[
+                                        "agreement_x_pattern_index"
+                                    ],
+                                    "agreement_y_pattern_index": scenario[
+                                        "agreement_y_pattern_index"
+                                    ],
+                                    "agreement_x_pattern": scenario["agreement_x_pattern"],
+                                    "agreement_y_pattern": scenario["agreement_y_pattern"],
+                                    "target_agreement_x_by_question": target_x,
+                                    "target_agreement_y_by_question": target_y,
+                                }
+                            )
+                            rows.append(row)
+                    parameterization_index += 1
+
+        environment_manifests = [_environment_manifest(value) for value in environments]
+        question_manifests = [_question_manifest(value) for value in questions]
+        probe_manifests = [_probe_manifest(value) for value in probes]
+        common_k = _common_or_none([environment.k for environment in environments])
+        common_patterns = agreement_patterns(common_k) if common_k is not None else None
+        single_schedule_bank = (
+            schedule_banks[0]["question_schedules"] if len(schedule_banks) == 1 else None
+        )
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "generator_type": type(self).__name__,
+            "sampling_design": "agreement_cartesian_product",
+            "generator_seed": self.seed,
+            "num_question_sets": _common_or_none(total_question_set_counts),
+            "num_question_sets_per_agreement_cell": num_question_sets,
+            "agreement_patterns_per_candidate": _common_or_none(
+                agreement_pattern_counts
+            ),
+            "agreement_cell_count": _common_or_none(agreement_cell_counts),
+            "agreement_patterns": (
+                [agreement_pattern_text(pattern) for pattern in common_patterns]
+                if common_patterns is not None
+                else None
+            ),
+            "agreement_target_x": canonical_x,
+            "agreement_target_y": canonical_y,
+            "parameterization_count": len(parameterizations),
+            "environment_parameter_count": len(environments),
+            "question_parameter_count": len(questions),
+            "probe_parameter_count": len(probes),
+            "patterns_per_question_set": 1,
+            "presentations_per_scenario": _common_or_none(presentation_counts),
+            "rows_per_question_set": sum(
+                presentation_count * len(probes) * len(questions)
+                for presentation_count in presentation_counts
+            ),
+            "rows_per_agreement_cell": sum(
+                num_question_sets * presentation_count * len(probes) * len(questions)
+                for presentation_count in presentation_counts
+            ),
+            "control_positional_bias": _common_or_none(
+                [value.control_positional_bias for value in environments]
+            ),
+            "n": _common_or_none([value.n for value in environments]),
+            "k": common_k,
             "reliabilities_exact": _common_or_none(
                 [list(item["reliabilities_exact"]) for item in environment_manifests]
             ),
